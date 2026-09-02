@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "421782411966",
+    "project_id": "pg-girls",
+    "storage_bucket": "pg-girls.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:421782411966:android:45037975c2b97895c45cef",
+        "android_client_info": {
+          "package_name": "emkiwear.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "421782411966-f9di79irqh90knbuhaadl4rh0b3srsvc.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC3gX0ggesbrbyAciEPZ9hEvap7P9pX1bs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "421782411966-f9di79irqh90knbuhaadl4rh0b3srsvc.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

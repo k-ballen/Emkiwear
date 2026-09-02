@@ -1,0 +1,27 @@
+Launching lib\main.dart on sdk gphone64 x86 64 in debug mode...
+Running Gradle task 'assembleDebug'...                          
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':gradle:compileKotlin'.
+> Could not resolve all dependencies for configuration ':gradle:compileClasspath'.
+   > java.io.IOException: Espacio en disco insuficiente
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights from a Build Scan (powered by Develocity).
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 4s
+Running Gradle task 'assembleDebug'...                              4,9s
+Unhandled exception:
+FileSystemException: writeFrom failed, path = 'C:\Users\USER\AppData\Local\Temp\flutter_tools.ac86e964\flutter_tool.2f564d4b\app.dill' (OS Error: Espacio en disco insuficiente, errno = 112)
+#0      _checkForErrorResponse (dart:io/common.dart:58)
+#1      _RandomAccessFile.writeFrom.<anonymous closure> (dart:io/file_impl.dart:976)
+<asynchronous suspension>
+#2      _FileStreamConsumer.addStream.<anonymous closure>.<anonymous closure>.<anonymous closure> (dart:io/file_impl.dart:237)
+<asynchronous suspension>
+The Dart compiler exited unexpectedly.
+Error: Gradle task assembleDebug failed with exit code 1

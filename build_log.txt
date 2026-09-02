@@ -1,0 +1,88 @@
+Running Gradle task 'assembleDebug'...                          
+
+FAILURE: Build completed with 2 failures.
+
+1: Task failed with an exception.
+-----------
+* What went wrong:
+A problem occurred configuring project ':flutter_tts'.
+> Could not resolve all artifacts for configuration 'classpath'.
+   > Failed to transform gradle-8.13.0.jar (com.android.tools.build:gradle:8.13.0) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.dependency.bundling=external, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.jvm.environment=standard-jvm, org.gradle.jvm.version=11, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime, org.jetbrains.kotlin.platform.type=jvm}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\a220ceab851a66a6e520930c24044de7\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create Jar file C:\Users\USER\.gradle\caches\9.3.1\transforms\25e2ecb10542f3069bf181b9c7ebf801\workspace\transformed\instrumented\instrumented-gradle-8.13.0.jar.
+   > Failed to transform kotlin-gradle-plugin-2.2.20-gradle813.jar (org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.dependency.bundling=external, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.jvm.environment=standard-jvm, org.gradle.jvm.version=8, org.gradle.libraryelements=jar, org.gradle.plugin.api-version=8.13, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\f53da31655c4e04e338f27021acb8f9b\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create Jar file C:\Users\USER\.gradle\caches\9.3.1\transforms\5f83ca52908a71cf9386a5ff5e8093f5\workspace\transformed\instrumented\instrumented-kotlin-gradle-plugin-2.2.20-gradle813.jar.
+   > Failed to transform builder-8.13.0.jar (com.android.tools.build:builder:8.13.0) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.dependency.bundling=external, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.jvm.environment=standard-jvm, org.gradle.jvm.version=11, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime, org.jetbrains.kotlin.platform.type=jvm}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\7e7568f9bb6c0e7e5dbc5ffd3582db56\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create Jar file C:\Users\USER\.gradle\caches\9.3.1\transforms\e531dbd27a81835d16b28ffcf592865f\workspace\transformed\instrumented\instrumented-builder-8.13.0.jar.
+   > Failed to transform protos-31.13.0.jar (com.android.tools.analytics-library:protos:31.13.0) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\7ec43a67dcc303aee3194153e9cb372d\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create Jar file C:\Users\USER\.gradle\caches\9.3.1\transforms\4b4445aa6e16f3d0b7863c615ae3394d\workspace\transformed\instrumented\instrumented-protos-31.13.0.jar.
+   > Failed to transform kotlin-gradle-plugin-idea-proto-2.2.20.jar (org.jetbrains.kotlin:kotlin-gradle-plugin-idea-proto:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\4a1b03587327d3901c29cdcf78115cf5\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create Jar file C:\Users\USER\.gradle\caches\9.3.1\transforms\65f53c732dea5d40fbaff74b2219b53d\workspace\transformed\instrumented\instrumented-kotlin-gradle-plugin-idea-proto-2.2.20.jar.
+   > Failed to transform signflinger-8.13.0.jar (com.android:signflinger:8.13.0) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\05712e907135a024af774d43ee39bc23\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\fa5ef57440b5e8d2af0e09f5db48951f\workspace\transformed\instrumented'
+   > Failed to transform zipflinger-8.13.0.jar (com.android:zipflinger:8.13.0) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\2f26005f85871822e7c2b263c51cadc6\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create Jar file C:\Users\USER\.gradle\caches\9.3.1\transforms\3c36fde01fdf627dd101239db717f365\workspace\transformed\instrumented\instrumented-zipflinger-8.13.0.jar.
+   > Failed to transform apksig-8.13.0.jar (com.android.tools.build:apksig:8.13.0) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\a0e82bf07c2bcc942be2e53127916fd7\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\16f0d8babc7f35d1d57578f46fbc1ace\workspace\transformed\instrumented'
+   > Failed to transform kotlin-tooling-core-2.2.20.jar (org.jetbrains.kotlin:kotlin-tooling-core:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\c2ca9594a6e7d2cf1a4b84682938fa49\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\4508943a83f55646b698f27b8c32ed94\workspace\transformed\instrumented'
+   > Failed to transform kotlin-native-utils-2.2.20.jar (org.jetbrains.kotlin:kotlin-native-utils:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\5336ed06099ac77bae94f2778039aca9\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\5a200956850fbebf5fe9681ba3956499\workspace\transformed\instrumented'
+   > Failed to transform kotlin-build-tools-api-2.2.20.jar (org.jetbrains.kotlin:kotlin-build-tools-api:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\b9d0f601e4b44a3241fb4dd558171e19\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\2cc13711f9168c200ca61296aca71ae3\workspace\transformed\instrumented'
+   > Failed to transform kotlin-util-klib-2.2.20.jar (org.jetbrains.kotlin:kotlin-util-klib:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\1469f82808dc2ed88a1953b743981550\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\b76683dbbe69bac2a292b4e7de211813\workspace\transformed\instrumented'
+   > Failed to transform kotlin-util-io-2.2.20.jar (org.jetbrains.kotlin:kotlin-util-io:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\2f6675fe48133fb69b41fb3ec572c5e6\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\06d7016089d4c62c3a53e2b444be6be1\workspace\transformed\instrumented'
+   > Failed to transform kotlin-daemon-client-2.2.20.jar (org.jetbrains.kotlin:kotlin-daemon-client:2.2.20) to match attributes {artifactType=jar, org.gradle.category=library, org.gradle.internal.instrumented=instrumented-and-upgraded, org.gradle.libraryelements=jar, org.gradle.status=release, org.gradle.usage=java-runtime}.
+      > Execution failed for ExternalDependencyInstrumentingArtifactTransform: C:\Users\USER\.gradle\caches\9.3.1\transforms\06fde733a3842595f761eeb1bbf0aa2c\workspace\transformed\merge\instrumentation-dependencies.bin.
+         > Failed to create directory 'C:\Users\USER\.gradle\caches\9.3.1\transforms\1f33cacdbd63600c7a6e992ddb62269f\workspace\transformed\instrumented'
+> java.lang.NullPointerException (no error message)
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights from a Build Scan (powered by Develocity).
+> Get more help at https://help.gradle.org.
+==============================================================================
+
+2: Task failed with an exception.
+-----------
+* What went wrong:
+java.io.IOException: Espacio en disco insuficiente
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights from a Build Scan (powered by Develocity).
+> Get more help at https://help.gradle.org.
+==============================================================================
+
+BUILD FAILED in 2m 28s
+Running Gradle task 'assembleDebug'...                            149,2s
+
+┌─ Flutter Fix ────────────────────────────────────────────────────────────────────────┐
+│ [!] Starting AGP 9+, only the new DSL interface will be read.                        │
+│ This results in a build failure when applying the Flutter Gradle plugin at           │
+│ D:\Dowloads\mi_primer_app\android\app\build.gradle.kts.                              │
+│                                                                                      │
+│ To resolve this update flutter or opt out of `android.newDsl`.                       │
+│ For instructions on how to opt out, see:                                             │
+│ https://developer.android.com/build/releases/agp-9-0-0-release-notes                 │
+│                                                                                      │
+│ If you are not upgrading to AGP 9+, run `flutter analyze --suggestions` to check for │
+│ incompatible dependencies.                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+Gradle task assembleDebug failed with exit code 1
