@@ -11,6 +11,7 @@ import '../models/medication_task.dart';
 import '../models/food_habit.dart';
 import '../models/activity_habit.dart';
 import '../models/user_profile.dart';
+import '../models/tremor_summary.dart';
 
 class FirebaseService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
@@ -339,9 +340,42 @@ class FirebaseService {
   }
 
   // Temblor (Desde ESP32)
+  Future<void> addTremorData(TremorData data) async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    try {
+      await _db.collection('tremor_readings').add({
+        ...data.toFirestore(),
+        'userId': uid,
+      });
+    } catch (e) {
+      developer.log('Error al guardar datos de temblor: $e');
+    }
+  }
+
+  Future<void> addTremorSummary(TremorSummary summary) async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    try {
+      // Usamos el ID determinístico para evitar duplicados y permitir mezclar datos
+      await _db.collection('tremor_summaries').doc(summary.id).set(
+        {
+          ...summary.toFirestore(),
+          'userId': uid,
+        },
+        SetOptions(merge: true),
+      );
+    } catch (e) {
+      developer.log('Error al guardar resumen de temblor: $e');
+    }
+  }
+
   Stream<List<TremorData>> getTremorStream() {
+    final uid = currentUserId;
+    if (uid == null) return Stream.value([]);
     return _db
         .collection('tremor_readings')
+        .where('userId', isEqualTo: uid)
         .orderBy('timestamp', descending: true)
         .limit(20)
         .snapshots()
