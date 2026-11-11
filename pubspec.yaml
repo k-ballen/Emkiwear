@@ -11,13 +11,12 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  # Pin exacto: 5.4.2 está publicado con código Pigeon v9 (nombres de canal sin
-  # prefijo) incompatible con el nativo (Pigeon v25). 5.4.1 regeneró el Dart con
-  # v25 y alinea los canales (dev.flutter.pigeon.firebase_core_platform_interface.*).
-  firebase_core_platform_interface: 5.4.1
-  firebase_core: ^3.3.0
-  cloud_firestore: ^5.2.0
-  firebase_auth: ^5.1.4
+  # Línea firebase_core 4.x: necesaria para firebase_app_check >= 0.4.1
+  # (token de depuración fijo con AndroidDebugProvider(debugToken: ...)).
+  # Se quitó el pin de firebase_core_platform_interface 5.4.1 (era para core 3.x).
+  firebase_core: ^4.15.2
+  cloud_firestore: ^6.10.2
+  firebase_auth: ^6.7.1
   google_sign_in: ^6.2.1
   provider: ^6.1.2
   fl_chart: ^0.68.0
@@ -25,10 +24,12 @@ dependencies:
   intl: ^0.19.0
   table_calendar: ^3.1.2
   image_picker: ^1.1.2
-  firebase_storage: ^12.1.2
+  firebase_storage: ^13.6.1
   speech_to_text: ^7.2.0
   flutter_tts: ^4.2.1
-  firebase_vertexai: ^0.2.0
+  firebase_ai: ^4.0.0
+  firebase_app_check: ^0.4.9
+  firebase_remote_config: ^6.7.1
   permission_handler: ^11.3.1
   flutter_blue_plus: ^1.31.0
   shared_preferences: ^2.2.2

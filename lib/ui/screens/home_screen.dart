@@ -1,6 +1,9 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import '../../services/app_check_info.dart';
 import '../../services/firebase_service.dart';
+import '../../services/offline_speech_service.dart';
 import '../../services/voice_assistant_service.dart';
 import '../widgets/assistant_button.dart';
 import 'tremor_chart_screen.dart';
@@ -167,7 +170,8 @@ class AssistantModal extends StatefulWidget {
 }
 
 class _AssistantModalState extends State<AssistantModal> {
-  final VoiceAssistantService _voiceService = VoiceAssistantService();
+  // Instancia única compartida: conserva el chat con Gemini entre aperturas del modal.
+  final VoiceAssistantService _voiceService = VoiceAssistantService.instance;
 
   bool _isListening = false;
   bool _isProcessing = false;
@@ -175,10 +179,54 @@ class _AssistantModalState extends State<AssistantModal> {
   String _assistantText = '';
   String _statusMessage = 'Inicializando micrófono...';
 
+  // Voz en español sin conexión (modelo de reconocimiento en el dispositivo).
+  bool _offlineVoiceMissing = false;
+  bool _downloadingVoice = false;
+
   @override
   void initState() {
     super.initState();
     _initAndListen();
+    _checkOfflineVoice();
+  }
+
+  Future<void> _checkOfflineVoice() async {
+    final st = await OfflineSpeechService.status();
+    if (!mounted) return;
+    setState(() => _offlineVoiceMissing = st.supported && !st.hasSpanishInstalled);
+  }
+
+  Future<void> _downloadOfflineVoice() async {
+    await _voiceService.stopListening();
+    if (!mounted) return;
+    setState(() {
+      _downloadingVoice = true;
+      _isListening = false;
+      _statusMessage = 'Descargando la voz en español sin conexión... (necesita internet)';
+    });
+    final r = await OfflineSpeechService.downloadSpanish();
+    if (!mounted) return;
+    final installed = r == 'success' || r == 'already_installed';
+    setState(() {
+      _downloadingVoice = false;
+      _offlineVoiceMissing = !installed;
+      if (installed) {
+        _statusMessage = 'Listo: ya puedo escucharte sin internet. Toca HABLAR DE NUEVO.';
+      } else if (r == 'scheduled' || r == 'requested') {
+        _statusMessage = 'La descarga quedó en curso. Déjala terminar con internet '
+            '(puede pedir Wi-Fi) y vuelve a intentarlo en unos minutos.';
+      } else if (r == 'unsupported') {
+        _statusMessage = 'Este teléfono no permite descargar la voz sin conexión desde la app '
+            '(requiere Android 13 o superior).';
+      } else {
+        _statusMessage = 'No se pudo descargar la voz ($r). Revisa tu conexión a internet '
+            'e inténtalo de nuevo.';
+      }
+    });
+    if (r == 'scheduled' || r == 'requested') {
+      // Vuelve a revisar en un rato por si ya terminó.
+      Future.delayed(const Duration(seconds: 30), _checkOfflineVoice);
+    }
   }
 
   Future<void> _initAndListen() async {
@@ -195,7 +243,15 @@ class _AssistantModalState extends State<AssistantModal> {
         if (mounted) {
           setState(() {
             _isListening = false;
-            _statusMessage = 'Error de micrófono o permiso denegado.';
+            _statusMessage = _sttErrorMessage(msg);
+            if (const {
+              'error_language_unavailable',
+              'error_language_not_supported',
+              'error_network',
+              'error_network_timeout',
+            }.contains(msg)) {
+              _offlineVoiceMissing = true;
+            }
           });
         }
       },
@@ -271,6 +327,11 @@ class _AssistantModalState extends State<AssistantModal> {
 
     Widget targetScreen;
     switch (action) {
+      case AppVoiceAction.openHome:
+        // Cierra todo lo que haya encima (secciones y este modal) hasta el menú
+        // principal. La voz sigue: dispose() del modal ya no corta el TTS.
+        Navigator.of(context).popUntil((route) => route.isFirst);
+        return;
       case AppVoiceAction.openTremor:
         targetScreen = const TremorChartScreen();
         break;
@@ -333,9 +394,64 @@ class _AssistantModalState extends State<AssistantModal> {
     );
   }
 
+  /// Mensaje claro según el error del reconocimiento de voz.
+  String _sttErrorMessage(String code) {
+    switch (code) {
+      case 'error_permission':
+      case 'error_insufficient_permissions':
+        return 'Permiso de micrófono denegado. Actívalo en los ajustes del teléfono.';
+      case 'error_server_disconnected':
+        return 'El reconocimiento de voz del teléfono quedó ocupado. Cierra la app por '
+            'completo y vuelve a abrirla; si sigue igual, reinicia el teléfono.';
+      case 'error_language_unavailable':
+      case 'error_language_not_supported':
+      case 'error_network':
+      case 'error_network_timeout':
+        return 'Sin internet no puedo escucharte: falta la voz en español sin conexión. '
+            'Conéctate a internet y toca DESCARGAR VOZ SIN CONEXIÓN.';
+      case 'error_no_match':
+      case 'error_speech_timeout':
+        return 'No alcancé a escucharte. Toca HABLAR DE NUEVO.';
+      default:
+        return 'Error de micrófono ($code). Toca HABLAR DE NUEVO.';
+    }
+  }
+
+  /// Diagnóstico visible solo en compilaciones de depuración.
+  Widget _buildDebugDiagnostics() {
+    final String? error = _voiceService.lastGeminiError;
+    final String origen = _assistantText.isEmpty
+        ? '—'
+        : (_voiceService.lastReplyFromGemini ? 'Gemini' : 'respaldo local');
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(
+        children: [
+          Text(
+            '${AppCheckInfo.summary}\n'
+            'Modelo: ${_voiceService.modelName} · Vertex AI (global) · Respuesta: $origen',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 10, color: Colors.black45),
+          ),
+          if (error != null)
+            Text(
+              'Gemini error: $error',
+              textAlign: TextAlign.center,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 10, color: Colors.red, fontWeight: FontWeight.w600),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   void dispose() {
-    _voiceService.dispose();
+    // Solo apaga el micrófono. La voz no se corta aquí para que termine la
+    // frase al navegar (p. ej. "Listo, te llevo al inicio"); los botones
+    // CERRAR y X ya llaman a stopSpeaking(). La instancia compartida sigue viva.
+    _voiceService.stopListening();
     super.dispose();
   }
 
@@ -400,6 +516,7 @@ class _AssistantModalState extends State<AssistantModal> {
                 textAlign: TextAlign.center,
                 style: const TextStyle(fontSize: 13, color: Colors.purple, fontWeight: FontWeight.w500),
               ),
+              if (kDebugMode) _buildDebugDiagnostics(),
               const SizedBox(height: 10),
               Flexible(
                 child: SingleChildScrollView(
@@ -470,41 +587,70 @@ class _AssistantModalState extends State<AssistantModal> {
               ),
               const SizedBox(height: 8),
               if (_isListening) _ListeningIndicator(isListening: _isListening),
+              if (_downloadingVoice)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: LinearProgressIndicator(color: Color(0xFF6A1B9A)),
+                )
+              else if (_offlineVoiceMissing && !_isListening && !_isProcessing)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: TextButton.icon(
+                    onPressed: _downloadOfflineVoice,
+                    icon: const Icon(Icons.download_rounded, size: 18),
+                    label: const Text('DESCARGAR VOZ SIN CONEXIÓN'),
+                    style: TextButton.styleFrom(foregroundColor: const Color(0xFF6A1B9A)),
+                  ),
+                ),
               const SizedBox(height: 12),
-              SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    OutlinedButton.icon(
+              // Botones compactos: el tema global usa letra 22 y padding grande
+              // en ElevatedButton; aquí se reduce para que el texto quepa.
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
                       onPressed: () {
                         _voiceService.stopListening();
                         _voiceService.stopSpeaking();
                         Navigator.of(context).pop();
                       },
                       icon: const Icon(Icons.close, size: 18),
-                      label: const Text('CERRAR'),
+                      label: const FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text('CERRAR', maxLines: 1),
+                      ),
                       style: OutlinedButton.styleFrom(
                         foregroundColor: Colors.grey.shade700,
                         side: BorderSide(color: Colors.grey.shade300),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+                        minimumSize: const Size(0, 46),
+                        textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
                       ),
                     ),
-                    const SizedBox(width: 12),
-                    if (!_isListening && !_isProcessing)
-                      ElevatedButton.icon(
+                  ),
+                  if (!_isListening && !_isProcessing) ...[
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton.icon(
                         onPressed: _startListeningSession,
-                        icon: const Icon(Icons.mic, size: 20),
-                        label: const Text('HABLAR DE NUEVO'),
+                        icon: const Icon(Icons.mic, size: 18),
+                        label: const FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text('HABLAR DE NUEVO', maxLines: 1),
+                        ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: const Color(0xFF6A1B9A),
                           foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+                          minimumSize: const Size(0, 46),
+                          textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
                         ),
                       ),
+                    ),
                   ],
-                ),
+                ],
               ),
             ],
           ),
