@@ -15,8 +15,15 @@ class TremorRepository {
   static const String summaryCharUuid = "7A9B0006-2D4E-4E6F-8A1B-0C2D3E4F5061";
   static const String rawCharUuid = "7A9B0007-2D4E-4E6F-8A1B-0C2D3E4F5061";
   static const String rawFifoCharUuid = "7A9B0008-2D4E-4E6F-8A1B-0C2D3E4F5061";
-  static const String diagCharUuid = "7A9B0009-2D4E-4E6F-8A1B-0C2D3E4F5061";
+  // Batería: READ + NOTIFY, 1 byte. 0xFE = nivel no disponible, 0xFF = entrando en modo carga.
+  static const String batteryCharUuid = "7A9B0009-2D4E-4E6F-8A1B-0C2D3E4F5061";
+  // Firmware anterior usaba 7A9B0009 para DIAG (16 bytes). Se distingue por longitud del paquete.
+  static const String diagCharUuid = batteryCharUuid;
   static const String sevCharUuid = "7A9B000A-2D4E-4E6F-8A1B-0C2D3E4F5061";
+
+  static const int batteryNotAvailable = 0xFE;
+  static const int batteryEnteringCharge = 0xFF;
+  static const int cmdChargeMode = 0xC0;
 
   final StreamController<TremorSample> _sampleController = StreamController<TremorSample>.broadcast();
   final StreamController<TremorStatus> _statusController = StreamController<TremorStatus>.broadcast();
@@ -27,6 +34,7 @@ class TremorRepository {
   final StreamController<RawImuSample> _rawController = StreamController<RawImuSample>.broadcast();
   final StreamController<RawAxisData> _rawAxisController = StreamController<RawAxisData>.broadcast();
   final StreamController<RawFifoPacket> _rawFifoController = StreamController<RawFifoPacket>.broadcast();
+  final StreamController<int> _batteryController = StreamController<int>.broadcast();
 
   Stream<TremorSample> get sampleStream => _sampleController.stream;
   Stream<TremorStatus> get statusStream => _statusController.stream;
@@ -37,6 +45,8 @@ class TremorRepository {
   Stream<RawImuSample> get rawStream => _rawController.stream;
   Stream<RawAxisData> get rawAxisStream => _rawAxisController.stream;
   Stream<RawFifoPacket> get rawFifoStream => _rawFifoController.stream;
+  /// Byte crudo de batería (0-100 = %, 0xFE = no disponible, 0xFF = entrando en modo carga).
+  Stream<int> get batteryStream => _batteryController.stream;
 
   BluetoothCharacteristic? _cmdChar;
 
@@ -142,6 +152,20 @@ class TremorRepository {
 
     _diagController.add(diag);
     return diag;
+  }
+
+  void decodeBattery(List<int> value) {
+    if (value.length != 1) return;
+    _batteryController.add(value[0] & 0xFF);
+  }
+
+  /// Característica 7A9B0009: 1 byte = batería, 16 bytes = DIAG (firmware anterior).
+  void decodeBatteryOrDiag(List<int> value) {
+    if (value.length == 1) {
+      decodeBattery(value);
+    } else {
+      decodeDiag(value);
+    }
   }
 
   void decodeSummary(List<int> value, String userId) {
@@ -281,6 +305,20 @@ class TremorRepository {
     await _cmdChar!.write([enable ? 0x03 : 0x02]);
   }
 
+  /// Envía 0xC0: el reloj deja de transmitir y se apaga para cargar.
+  /// Devuelve false si no hay característica de control o la escritura falla
+  /// (puede fallar si el reloj se apaga antes de confirmar).
+  Future<bool> sendChargeModeCommand() async {
+    if (_cmdChar == null) return false;
+    try {
+      await _cmdChar!.write([cmdChargeMode]);
+      return true;
+    } catch (e) {
+      print("BLE: Escritura 0xC0 falló o el reloj se apagó antes de confirmar: $e");
+      return false;
+    }
+  }
+
   void setCmdCharacteristic(BluetoothCharacteristic char) {
     _cmdChar = char;
   }
@@ -295,5 +333,6 @@ class TremorRepository {
     _rawController.close();
     _rawAxisController.close();
     _rawFifoController.close();
+    _batteryController.close();
   }
 }

@@ -84,7 +84,7 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
                 : null,
             tooltip: tremorProvider.isStreaming ? "Pausar Transmisión" : "Reanudar Transmisión",
           ),
-          _buildConnectionBadge(tremorProvider.connectionState),
+          _buildConnectionBadge(tremorProvider.connectionState, chargeMode: tremorProvider.chargeMode),
         ],
       ),
       body: Container(
@@ -102,6 +102,13 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
               if (tremorProvider.isFirmwareOutdated) ...[
                 _buildFirmwareWarningBanner(),
                 const SizedBox(height: 16),
+              ],
+              if (tremorProvider.chargeMode) ...[
+                _buildChargeModeBanner(tremorProvider),
+                const SizedBox(height: 16),
+              ] else ...[
+                _buildDeviceStatusRow(tremorProvider),
+                const SizedBox(height: 12),
               ],
               _buildMainCurrentStateCard(tremorProvider),
               const SizedBox(height: 12),
@@ -126,8 +133,8 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
           const SizedBox(height: 12),
           FloatingActionButton(
             heroTag: 'refresh_ble_btn',
-            onPressed: () => tremorProvider.retryConnection(),
-            backgroundColor: Colors.purple,
+            onPressed: tremorProvider.chargeMode ? null : () => tremorProvider.retryConnection(),
+            backgroundColor: tremorProvider.chargeMode ? Colors.grey : Colors.purple,
             child: const Icon(Icons.refresh),
           ),
         ],
@@ -162,9 +169,157 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
     );
   }
 
-  Widget _buildConnectionBadge(BluetoothConnectionState state) {
+  // ESTADO DEL DISPOSITIVO: batería + botón "Modo carga"
+  Widget _buildDeviceStatusRow(TremorProvider provider) {
+    final isConnected = provider.connectionState == BluetoothConnectionState.connected;
+    final canEnter = isConnected && !provider.enteringChargeMode;
+
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        child: Row(
+          children: [
+            Icon(
+              provider.batteryPercent == null ? Icons.battery_unknown : Icons.battery_std,
+              color: Colors.purple,
+              size: 20,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                provider.batteryDisplay,
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              ),
+            ),
+            OutlinedButton.icon(
+              onPressed: canEnter ? () => _confirmChargeMode(provider) : null,
+              icon: provider.enteringChargeMode
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.battery_charging_full),
+              label: const Text('Modo carga'),
+              style: OutlinedButton.styleFrom(foregroundColor: Colors.purple),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmChargeMode(TremorProvider provider) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.battery_charging_full, color: Colors.purple),
+        title: const Text('Modo carga'),
+        content: const Text(
+          'El reloj dejará de enviar datos y se apagará para cargar más rápido. '
+          'Para encenderlo, mantén presionado su botón 2 segundos '
+          '(o se encenderá solo en 3 horas).',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Activar'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await provider.enterChargeMode();
+    }
+  }
+
+  Widget _buildChargeModeBanner(TremorProvider provider) {
+    final elapsed = provider.chargeModeElapsed;
+    final h = elapsed.inHours;
+    final m = elapsed.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = elapsed.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final elapsedStr = h > 0 ? '$h:$m:$s' : '$m:$s';
+
+    return Card(
+      elevation: 4,
+      color: Colors.amber.shade50,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(color: Colors.amber.shade700),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Icon(Icons.battery_charging_full, color: Colors.amber.shade800, size: 32),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Reloj en modo carga',
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.amber.shade900,
+                        ),
+                      ),
+                      Text(
+                        'Tiempo transcurrido: $elapsedStr',
+                        style: const TextStyle(fontSize: 13, color: Colors.black87),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Buscando el reloj cada minuto. Al encenderse se reconectará solo.',
+              style: TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () async {
+                  await provider.finishCharging();
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Mantén presionado el botón del reloj 2 segundos para encenderlo'),
+                      duration: Duration(seconds: 6),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.check),
+                label: const Text('Terminé de cargar'),
+                style: FilledButton.styleFrom(backgroundColor: Colors.amber.shade800),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConnectionBadge(BluetoothConnectionState state, {bool chargeMode = false}) {
     Color color;
     String text;
+    if (chargeMode) {
+      color = Colors.amber.shade800;
+      text = "Modo carga";
+      return _badgeContainer(color, text);
+    }
     switch (state) {
       case BluetoothConnectionState.connected:
         color = Colors.green;
@@ -179,6 +334,10 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
         text = "Desconectado";
     }
 
+    return _badgeContainer(color, text);
+  }
+
+  Widget _badgeContainer(Color color, String text) {
     return Container(
       margin: const EdgeInsets.only(right: 12),
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -489,7 +648,13 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
             child: cardChild,
           ),
         ),
-        if (isStale) ...[
+        if (isStale && provider.chargeMode) ...[
+          const SizedBox(height: 6),
+          const Text(
+            "Último dato antes del modo carga",
+            style: TextStyle(fontSize: 12, color: Colors.grey, fontWeight: FontWeight.w500),
+          ),
+        ] else if (isStale) ...[
           const SizedBox(height: 6),
           Text(
             "Reconectando… · último dato hace $elapsedSeconds s",

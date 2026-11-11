@@ -166,6 +166,38 @@ class TremorProvider with ChangeNotifier {
   double? _lastValidDesplazCm;
   DateTime? _lastValidDesplazCmTime;
 
+  // Batería (byte crudo de 7A9B0009). 0xFE/0xFF NUNCA se muestran como % ni se suben a Firestore.
+  int? _batteryRaw;
+
+  // Modo carga
+  static const String _prefsChargeMode = 'charge_mode';
+  static const String _prefsChargeModeStart = 'charge_mode_start_ms';
+  bool _chargeMode = false;
+  DateTime? _chargeModeStart;
+  bool _enteringChargeMode = false;
+  Timer? _chargeProbeTimer;
+  Timer? _chargeTickTimer;
+  bool _probeInProgress = false;
+
+  bool get chargeMode => _chargeMode;
+  DateTime? get chargeModeStart => _chargeModeStart;
+  bool get enteringChargeMode => _enteringChargeMode;
+  Duration get chargeModeElapsed => _chargeModeStart == null
+      ? Duration.zero
+      : DateTime.now().difference(_chargeModeStart!);
+
+  /// Porcentaje válido (0-100) o null si no está disponible (0xFE, 0xFF o sin dato).
+  int? get batteryPercent {
+    final v = _batteryRaw;
+    if (v == null || v > 100) return null;
+    return v;
+  }
+
+  String get batteryDisplay {
+    final p = batteryPercent;
+    return p == null ? "Batería: no disponible" : "Batería: $p %";
+  }
+
   // Registro/Log de eventos BLE con fecha y hora
   final List<String> _bleLogs = [];
 
@@ -542,11 +574,24 @@ class TremorProvider with ChangeNotifier {
       notifyListeners();
     });
 
+    _repository.batteryStream.listen((raw) {
+      _batteryRaw = raw;
+      if (raw == TremorRepository.batteryEnteringCharge) {
+        _logBleEvent("Reloj notificó 0xFF: entrando en modo carga");
+      }
+      notifyListeners();
+    });
+
     FlutterBluePlus.events.onConnectionStateChanged.listen((event) {
       if (event.device.platformName == "ParkinsonWatch") {
         _connectionState = event.connectionState;
         if (_connectionState == BluetoothConnectionState.disconnected) {
-          _logBleEvent("Desconectado del reloj (ParkinsonWatch)");
+          _batteryRaw = null;
+          if (_chargeMode || _enteringChargeMode) {
+            _logBleEvent("Reloj apagado para modo carga (sin alerta de desconexión)");
+          } else {
+            _logBleEvent("Desconectado del reloj (ParkinsonWatch)");
+          }
           _isStreaming = false;
           _lastStatus = null;
           _lastExt = null;
@@ -571,7 +616,142 @@ class TremorProvider with ChangeNotifier {
       }
     });
 
+    _initConnection();
+  }
+
+  Future<void> _initConnection() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(_prefsChargeMode) ?? false) {
+        final startMs = prefs.getInt(_prefsChargeModeStart);
+        _chargeMode = true;
+        _chargeModeStart = startMs != null
+            ? DateTime.fromMillisecondsSinceEpoch(startMs)
+            : DateTime.now();
+        _bleService.chargeMode = true;
+        _isStreaming = false;
+        _logBleEvent("Modo carga restaurado al iniciar la app");
+        _startChargeModeTimers();
+        notifyListeners();
+        return;
+      }
+    } catch (e) {
+      print("TremorProvider: Error leyendo modo carga: $e");
+    }
     _bleService.startScanAndConnect();
+  }
+
+  // ================= MODO CARGA =================
+
+  /// Cierra la sesión de monitoreo: guarda y sincroniza lo pendiente para que el
+  /// tiempo de carga no cuente como monitoreado ni genere ventanas vacías.
+  Future<void> closeMonitoringSession() async {
+    _isStreaming = false;
+    _analyzingStartTime = null;
+    try {
+      await _saveBuckets();
+      await uploadSummary();
+    } catch (e) {
+      print("TremorProvider: Error al cerrar sesión de monitoreo: $e");
+    }
+    _logBleEvent("Sesión de monitoreo cerrada (modo carga)");
+  }
+
+  Future<void> enterChargeMode() async {
+    if (_chargeMode || _enteringChargeMode) return;
+    if (_connectionState != BluetoothConnectionState.connected) return;
+    _enteringChargeMode = true;
+    notifyListeners();
+
+    try {
+      // 1. Cerrar sesión de monitoreo (guardar + sincronizar)
+      await closeMonitoringSession();
+
+      // 2. Bloquear reconexión automática ANTES de que el reloj se apague
+      _bleService.chargeMode = true;
+
+      // 3. Escuchar 0xFF antes de escribir para no perder la notificación
+      final ackFuture = _repository.batteryStream
+          .firstWhere((v) => v == TremorRepository.batteryEnteringCharge)
+          .timeout(const Duration(seconds: 3));
+
+      // 4. Escribir 0xC0 en la característica de control (7A9B0004)
+      await _repository.sendChargeModeCommand();
+
+      // 5. Esperar 0xFF (timeout 3 s). Si llega o hay timeout, continuar igual.
+      try {
+        await ackFuture;
+        _logBleEvent("Confirmación 0xFF recibida");
+      } catch (_) {
+        _logBleEvent("Sin confirmación 0xFF en 3 s; se continúa");
+      }
+
+      // 6. Persistir modo carga
+      _chargeMode = true;
+      _chargeModeStart = DateTime.now();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefsChargeMode, true);
+      await prefs.setInt(_prefsChargeModeStart, _chargeModeStart!.millisecondsSinceEpoch);
+
+      // 7. Liberar la conexión sin disparar reconexión
+      await _bleService.disconnectForChargeMode();
+      _startChargeModeTimers();
+    } finally {
+      _enteringChargeMode = false;
+      notifyListeners();
+    }
+  }
+
+  /// "Terminé de cargar": sale del modo carga y reactiva la conexión normal.
+  Future<void> finishCharging() async {
+    await _exitChargeMode();
+    await _bleService.resumeNormalConnection();
+  }
+
+  Future<void> _exitChargeMode() async {
+    _chargeProbeTimer?.cancel();
+    _chargeTickTimer?.cancel();
+    _chargeProbeTimer = null;
+    _chargeTickTimer = null;
+    _chargeMode = false;
+    _chargeModeStart = null;
+    _bleService.chargeMode = false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_prefsChargeMode);
+      await prefs.remove(_prefsChargeModeStart);
+    } catch (_) {}
+    _logBleEvent("Modo carga finalizado");
+    notifyListeners();
+  }
+
+  void _startChargeModeTimers() {
+    _chargeTickTimer?.cancel();
+    _chargeTickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_chargeMode) notifyListeners();
+    });
+    _chargeProbeTimer?.cancel();
+    _chargeProbeTimer = Timer.periodic(const Duration(seconds: 60), (_) => _probeForWatch());
+  }
+
+  /// Escaneo corto (5 s). Si el reloj aparece, sale del modo carga y se reconecta;
+  /// la reconexión reinicia los contadores e inicia una sesión nueva.
+  Future<void> _probeForWatch() async {
+    if (!_chargeMode || _probeInProgress) return;
+    _probeInProgress = true;
+    try {
+      final device = await _bleService.probeScanForWatch(timeout: const Duration(seconds: 5));
+      if (device != null && _chargeMode) {
+        _logBleEvent("Reloj detectado durante modo carga; reconectando");
+        await _exitChargeMode();
+        await _bleService.connectToDevice(device);
+        if (_bleService.connectedDevice == null) {
+          await _bleService.resumeNormalConnection();
+        }
+      }
+    } finally {
+      _probeInProgress = false;
+    }
   }
 
   void resetSessionCounters() {
@@ -850,6 +1030,7 @@ class TremorProvider with ChangeNotifier {
   }
 
   Future<void> retryConnection() async {
+    if (_chargeMode) return;
     await _bleService.startScanAndConnect();
   }
 
@@ -895,6 +1076,8 @@ class TremorProvider with ChangeNotifier {
   @override
   void dispose() {
     _timeoutCheckTimer?.cancel();
+    _chargeProbeTimer?.cancel();
+    _chargeTickTimer?.cancel();
     _repository.dispose();
     _rawFirestoreService.dispose();
     _csvCaptureService.dispose();

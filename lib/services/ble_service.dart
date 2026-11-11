@@ -24,12 +24,94 @@ class BleService {
   StreamSubscription? _lastRawSub;
   StreamSubscription? _lastRawFifoSub;
 
+  StreamSubscription? _lastBatterySub;
+
   bool _isConnecting = false;
   bool _isReconnecting = false;
   bool _userDisconnected = false;
+  // Mientras sea true: sin reconexión automática ni escaneo normal.
+  bool _chargeMode = false;
+  bool _isProbeScanning = false;
   DeviceInfo? deviceInfo;
 
   BleService(this.repository);
+
+  bool get chargeMode => _chargeMode;
+  set chargeMode(bool value) {
+    _chargeMode = value;
+    if (value) _isReconnecting = false;
+  }
+
+  /// Corta la conexión al entrar en modo carga sin disparar reconexión.
+  Future<void> disconnectForChargeMode() async {
+    _chargeMode = true;
+    _isReconnecting = false;
+    final device = _connectedDevice;
+    if (device != null) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
+    }
+    _cleanupConnection();
+  }
+
+  /// Escaneo corto buscando el reloj. Devuelve el dispositivo si lo encuentra.
+  Future<BluetoothDevice?> probeScanForWatch({Duration timeout = const Duration(seconds: 5)}) async {
+    if (_isProbeScanning || _isConnecting || _connectedDevice != null) return null;
+    try {
+      final adapter = await FlutterBluePlus.adapterState.first;
+      if (adapter != BluetoothAdapterState.on) return null;
+    } catch (_) {}
+
+    _isProbeScanning = true;
+    final completer = Completer<BluetoothDevice?>();
+    StreamSubscription? sub;
+    try {
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+
+      sub = FlutterBluePlus.onScanResults.listen((results) {
+        for (final r in results) {
+          String name = r.device.platformName;
+          if (name.isEmpty) name = r.advertisementData.localName;
+          if (name == "ParkinsonWatch" && !completer.isCompleted) {
+            completer.complete(r.device);
+            break;
+          }
+        }
+      }, onError: (e) => print("BLE Probe Scan Error: $e"));
+
+      await FlutterBluePlus.startScan(timeout: timeout, androidUsesFineLocation: true);
+      final found = await completer.future.timeout(
+        timeout + const Duration(milliseconds: 500),
+        onTimeout: () => null,
+      );
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      return found;
+    } catch (e) {
+      print("BLE: Error en escaneo corto: $e");
+      return null;
+    } finally {
+      await sub?.cancel();
+      _isProbeScanning = false;
+    }
+  }
+
+  /// Sale del modo carga y reactiva la conexión normal (reconexión automática si
+  /// se conoce el último reloj; si no, escaneo normal).
+  Future<void> resumeNormalConnection() async {
+    _chargeMode = false;
+    _userDisconnected = false;
+    if (_connectedDevice != null) return;
+    if (_lastDevice != null || (_lastDeviceId != null && _lastDeviceId!.isNotEmpty)) {
+      _startAutoReconnect();
+    } else {
+      await startScanAndConnect();
+    }
+  }
 
   Stream<BluetoothAdapterState> get adapterState => FlutterBluePlus.adapterState;
   BluetoothDevice? get connectedDevice => _connectedDevice;
@@ -66,7 +148,7 @@ class BleService {
   }
 
   Future<void> startScanAndConnect() async {
-    if (_connectedDevice != null || _isConnecting) return;
+    if (_connectedDevice != null || _isConnecting || _chargeMode) return;
     _userDisconnected = false;
     
     _isConnecting = true;
@@ -141,7 +223,7 @@ class BleService {
         if (state == BluetoothConnectionState.disconnected) {
           print("BLE: Desconectado de ${device.platformName}.");
           _cleanupConnection();
-          if (!_userDisconnected) {
+          if (!_userDisconnected && !_chargeMode) {
             _startAutoReconnect();
           }
         }
@@ -179,12 +261,18 @@ class BleService {
               } catch (e) {
                 print("BLE: Opcional SEV no disponible: $e");
               }
-            } else if (uuid == TremorRepository.diagCharUuid) {
+            } else if (uuid == TremorRepository.batteryCharUuid) {
+              // 7A9B0009: batería (1 byte). Si un firmware anterior manda DIAG (16 bytes), se decodifica como DIAG.
               try {
-                await subscribeWithRetry(char);
-                _lastDiagSub = char.onValueReceived.listen((value) => repository.decodeDiag(value));
+                _lastBatterySub = char.onValueReceived.listen((value) => repository.decodeBatteryOrDiag(value));
+                final ok = await subscribeWithRetry(char);
+                if (ok) print("BATERIA (7A9B0009) suscrita");
+                if (char.properties.read) {
+                  final initial = await char.read();
+                  repository.decodeBatteryOrDiag(initial);
+                }
               } catch (e) {
-                print("BLE: Opcional DIAG no disponible: $e");
+                print("BLE: Característica de batería no disponible: $e");
               }
             } else if (uuid == TremorRepository.summaryCharUuid) {
               await subscribeWithRetry(char);
@@ -289,7 +377,7 @@ class BleService {
   }
 
   Future<void> _startAutoReconnect() async {
-    if (_userDisconnected || _isReconnecting || _connectedDevice != null) return;
+    if (_userDisconnected || _chargeMode || _isReconnecting || _connectedDevice != null) return;
     _isReconnecting = true;
 
     final backoffSteps = [1, 2, 4];
@@ -297,14 +385,14 @@ class BleService {
 
     print("BLE: Iniciando reconexión automática para $_lastDeviceId...");
 
-    while (!_userDisconnected && _connectedDevice == null) {
+    while (!_userDisconnected && !_chargeMode && _connectedDevice == null) {
       final delaySec = stepIndex < backoffSteps.length ? backoffSteps[stepIndex] : 5;
       stepIndex++;
 
       print("BLE: Reintentando conexión en $delaySec s (intento $stepIndex)...");
       await Future.delayed(Duration(seconds: delaySec));
 
-      if (_userDisconnected || _connectedDevice != null) break;
+      if (_userDisconnected || _chargeMode || _connectedDevice != null) break;
 
       try {
         final adapter = await FlutterBluePlus.adapterState.first;
@@ -353,6 +441,7 @@ class BleService {
     _lastDiagSub?.cancel();
     _lastRawSub?.cancel();
     _lastRawFifoSub?.cancel();
+    _lastBatterySub?.cancel();
     _statusChar = null;
     _connectedDevice = null;
     _isConnecting = false;
