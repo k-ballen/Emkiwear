@@ -4,6 +4,7 @@ import 'dart:io';
 import '../../services/firebase_service.dart';
 import '../../models/user_profile.dart';
 import '../widgets/assistant_button.dart';
+import 'emergency_contacts_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -202,6 +203,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 if (_selectedSupportGroup == 'Otro')
                   _buildTextField('Nombre del grupo', _supportGroupOtherController),
                 
+                const SizedBox(height: 25),
+                _buildSectionTitle('Contactos de emergencia'),
+                OutlinedButton.icon(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const EmergencyContactsScreen()),
+                  ),
+                  icon: const Icon(Icons.contact_phone, color: Colors.red),
+                  label: const Text('Ver y editar contactos de emergencia'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.red.shade700,
+                    minimumSize: const Size.fromHeight(48),
+                    side: BorderSide(color: Colors.red.shade200),
+                  ),
+                ),
+
                 const SizedBox(height: 25),
                 _buildPrivacyToggle(),
                 

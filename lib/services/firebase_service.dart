@@ -5,13 +5,42 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:developer' as developer;
+import 'package:intl/intl.dart';
 import '../models/tremor_data.dart';
 import '../models/medication_task.dart';
+import '../models/medication_reminder.dart';
+import '../models/emergency_contact.dart';
 import '../models/food_habit.dart';
 import '../models/activity_habit.dart';
 import '../models/user_profile.dart';
 import '../models/tremor_summary.dart';
+
+/// Resumen de temblor de HOY (suma de los bloques de 5 min de tremor_summaries).
+/// Cada muestra STATUS equivale a 0,5 s.
+class TodayTremorSummary {
+  final int windows;
+  final int totalSamples;
+  final Map<String, int> severityCounts;
+  final double maxIntensity;
+  final double maxAngleDeg;
+
+  const TodayTremorSummary({
+    required this.windows,
+    required this.totalSamples,
+    required this.severityCounts,
+    required this.maxIntensity,
+    required this.maxAngleDeg,
+  });
+
+  static double _minutes(int samples) => samples * 0.5 / 60.0;
+
+  double get monitoredMinutes => _minutes(totalSamples);
+  int count(String key) => severityCounts[key] ?? 0;
+  double minutesOf(String key) => _minutes(count(key));
+  double get tremorMinutes => minutesOf('LEVE') + minutesOf('MODERADO') + minutesOf('GRAVE');
+}
 
 class FirebaseService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
@@ -142,6 +171,48 @@ class FirebaseService {
     await _db.collection('users').doc(uid).set(profile.toFirestore(), SetOptions(merge: true));
   }
 
+  // ===== Contactos de emergencia (users/{uid}.emergencyContacts) =====
+
+  Future<List<EmergencyContact>> getEmergencyContacts() async {
+    final uid = currentUserId;
+    if (uid == null) return const [];
+    final doc = await _db.collection('users').doc(uid).get();
+    final list = (doc.data()?['emergencyContacts'] as List?) ?? const [];
+    return list
+        .whereType<Map>()
+        .map((m) => EmergencyContact.fromMap(Map<String, dynamic>.from(m)))
+        .where((c) => c.phone.isNotEmpty)
+        .toList();
+  }
+
+  Stream<List<EmergencyContact>> streamEmergencyContacts() {
+    final uid = currentUserId;
+    if (uid == null) return Stream.value(const []);
+    return _db.collection('users').doc(uid).snapshots().map((doc) {
+      final list = (doc.data()?['emergencyContacts'] as List?) ?? const [];
+      return list
+          .whereType<Map>()
+          .map((m) => EmergencyContact.fromMap(Map<String, dynamic>.from(m)))
+          .toList();
+    });
+  }
+
+  Future<void> saveEmergencyContacts(List<EmergencyContact> contacts) async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    await _db.collection('users').doc(uid).set(
+      {'emergencyContacts': contacts.map((c) => c.toMap()).toList()},
+      SetOptions(merge: true),
+    );
+  }
+
+  /// Actualiza SOLO los campos dados del perfil (lo usa el asistente de voz).
+  Future<void> updateProfileFields(Map<String, dynamic> fields) async {
+    final uid = currentUserId;
+    if (uid == null || fields.isEmpty) return;
+    await _db.collection('users').doc(uid).set(fields, SetOptions(merge: true));
+  }
+
   Future<String> uploadProfilePhoto(File image) async {
     final uid = currentUserId;
     if (uid == null) return '';
@@ -207,6 +278,193 @@ class FirebaseService {
             .map((doc) => MedicationTask.fromFirestore(doc.id, doc.data()))
             .toList()
           ..sort((a, b) => a.scheduledDateTime.compareTo(b.scheduledDateTime)));
+  }
+
+  // ===== Consultas del día para el asistente (se leen del SERVIDOR) =====
+  // Si no hay conexión, lanzan excepción: el asistente dice "No pude consultar
+  // tus datos" en vez de responder con datos viejos de la caché.
+
+  /// Suma los bloques de 5 min de tremor_summaries de HOY (campo 'date').
+  /// Devuelve null si no hay bloques hoy.
+  Future<TodayTremorSummary?> getTodayTremorSummary({
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final uid = currentUserId;
+    if (uid == null) throw 'No hay un usuario autenticado';
+    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    final snap = await _db
+        .collection('tremor_summaries')
+        .where('userId', isEqualTo: uid)
+        .where('date', isEqualTo: today)
+        .get(const GetOptions(source: Source.server))
+        .timeout(timeout);
+    if (snap.docs.isEmpty) return null;
+
+    final counts = <String, int>{};
+    var totalSamples = 0;
+    var maxIntensity = 0.0;
+    var maxAngle = 0.0;
+    for (final doc in snap.docs) {
+      final d = doc.data();
+      totalSamples += (d['totalSamples'] as num?)?.toInt() ?? 0;
+      maxIntensity = math.max(maxIntensity, (d['maxIntensity'] as num?)?.toDouble() ?? 0);
+      maxAngle = math.max(maxAngle, (d['maxAngleDeg'] as num?)?.toDouble() ?? 0);
+      final sc = (d['severityCounts'] as Map?) ?? const {};
+      sc.forEach((k, v) => counts[k.toString()] = (counts[k.toString()] ?? 0) + ((v as num?)?.toInt() ?? 0));
+    }
+    return TodayTremorSummary(
+      windows: snap.docs.length,
+      totalSamples: totalSamples,
+      severityCounts: counts,
+      maxIntensity: maxIntensity,
+      maxAngleDeg: maxAngle,
+    );
+  }
+
+  /// Tomas de medicamento programadas para HOY, ordenadas por hora.
+  Future<List<MedicationTask>> getTodayMedications({
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final uid = currentUserId;
+    if (uid == null) throw 'No hay un usuario autenticado';
+    final now = DateTime.now();
+    final start = DateTime(now.year, now.month, now.day);
+    final end = DateTime(now.year, now.month, now.day, 23, 59, 59);
+    final snap = await _db
+        .collection('medication_tasks')
+        .where('userId', isEqualTo: uid)
+        .where('scheduledDateTime', isGreaterThanOrEqualTo: Timestamp.fromDate(start))
+        .where('scheduledDateTime', isLessThanOrEqualTo: Timestamp.fromDate(end))
+        .get(const GetOptions(source: Source.server))
+        .timeout(timeout);
+    return snap.docs.map((d) => MedicationTask.fromFirestore(d.id, d.data())).toList()
+      ..sort((a, b) => a.scheduledDateTime.compareTo(b.scheduledDateTime));
+  }
+
+  // ===== Recordatorios de medicamentos (medication_reminders) =====
+
+  Stream<List<MedicationReminder>> streamReminders() {
+    final uid = currentUserId;
+    if (uid == null) return Stream.value(const []);
+    return _db
+        .collection('medication_reminders')
+        .where('userId', isEqualTo: uid)
+        .snapshots()
+        .map((s) => s.docs.map((d) => MedicationReminder.fromFirestore(d.id, d.data())).toList()
+          ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase())));
+  }
+
+  /// Crea (id null) o actualiza un recordatorio. Devuelve el id.
+  Future<String> saveReminder(MedicationReminder r) async {
+    final uid = currentUserId;
+    if (uid == null) throw 'No hay un usuario autenticado';
+    final col = _db.collection('medication_reminders');
+    final ref = r.id.isEmpty ? col.doc() : col.doc(r.id);
+    await ref.set(r.toFirestore(uid), SetOptions(merge: true));
+    return ref.id;
+  }
+
+  Future<void> setReminderActive(String reminderId, bool active) async {
+    await _db.collection('medication_reminders').doc(reminderId).update({
+      'active': active,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  /// Borra el recordatorio y sus tomas FUTURAS no tomadas (el historial queda).
+  Future<void> deleteReminder(String reminderId) async {
+    await deleteFutureDoseTasks(reminderId);
+    await _db.collection('medication_reminders').doc(reminderId).delete();
+  }
+
+  /// Registra en medication_tasks una toma de recordatorio como TOMADA (solo
+  /// cuando el usuario toca "Ya la tomé"). Id determinístico: no se duplica.
+  Future<void> recordReminderDoseTaken({
+    required String taskId,
+    required String reminderId,
+    required String name,
+    required DateTime scheduled,
+    required DateTime takenAt,
+  }) async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    await _db.collection('medication_tasks').doc(taskId).set({
+      'name': name,
+      'scheduledDateTime': Timestamp.fromDate(scheduled),
+      'userId': uid,
+      'reminderId': reminderId,
+      'isTaken': true,
+      'takenDateTime': Timestamp.fromDate(takenAt),
+    }, SetOptions(merge: true));
+  }
+
+  /// Borra las tomas de recordatorio NO tomadas (versiones anteriores las
+  /// creaban por adelantado y aparecían en "Medicamentos de hoy").
+  Future<void> deleteUntakenReminderTasks() async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    // Las tomas viejas se crearon SIN el campo isTaken (no sirve filtrar por
+    // él): se buscan por fecha (los recordatorios creaban 14 días hacia
+    // adelante) y se filtran aquí.
+    final from = DateTime.now().subtract(const Duration(days: 2));
+    final snap = await _db
+        .collection('medication_tasks')
+        .where('userId', isEqualTo: uid)
+        .where('scheduledDateTime', isGreaterThanOrEqualTo: Timestamp.fromDate(from))
+        .get();
+    final batch = _db.batch();
+    var n = 0;
+    for (final d in snap.docs) {
+      final data = d.data();
+      if ((data['reminderId'] as String?)?.isNotEmpty == true && data['isTaken'] != true) {
+        batch.delete(d.reference);
+        n++;
+      }
+    }
+    if (n > 0) {
+      await batch.commit();
+      developer.log('Borradas $n tomas pendientes creadas por recordatorios');
+    }
+  }
+
+  /// Recordatorios del usuario (una sola lectura).
+  Future<List<MedicationReminder>> getReminders() async => streamReminders().first;
+
+  /// Ids de las tomas ya marcadas como tomadas desde [from] (para no volver a
+  /// programar notificaciones de pastillas ya tomadas).
+  Future<Set<String>> getTakenTaskIdsFrom(DateTime from) async {
+    final uid = currentUserId;
+    if (uid == null) return {};
+    final snap = await _db
+        .collection('medication_tasks')
+        .where('userId', isEqualTo: uid)
+        .where('scheduledDateTime', isGreaterThanOrEqualTo: Timestamp.fromDate(from))
+        .get();
+    return snap.docs.where((d) => d.data()['isTaken'] == true).map((d) => d.id).toSet();
+  }
+
+  /// Borra las tomas futuras NO tomadas de un recordatorio (al borrarlo,
+  /// desactivarlo o cambiar sus horas).
+  Future<void> deleteFutureDoseTasks(String reminderId) async {
+    final uid = currentUserId;
+    if (uid == null) return;
+    final snap = await _db
+        .collection('medication_tasks')
+        .where('userId', isEqualTo: uid)
+        .where('reminderId', isEqualTo: reminderId)
+        .get();
+    final now = DateTime.now();
+    final batch = _db.batch();
+    var n = 0;
+    for (final d in snap.docs) {
+      final data = d.data();
+      final when = (data['scheduledDateTime'] as Timestamp?)?.toDate();
+      if (when != null && when.isAfter(now) && data['isTaken'] != true) {
+        batch.delete(d.reference);
+        n++;
+      }
+    }
+    if (n > 0) await batch.commit();
   }
 
   Future<void> updateTaskStatus(String taskId, bool isTaken) async {

@@ -8,6 +8,9 @@ class MedicationTask {
   final DateTime? takenDateTime;
   final String userId;
 
+  /// Si la toma viene de un recordatorio programado (medication_reminders).
+  final String? reminderId;
+
   MedicationTask({
     required this.id,
     required this.name,
@@ -15,7 +18,10 @@ class MedicationTask {
     this.isTaken = false,
     this.takenDateTime,
     required this.userId,
+    this.reminderId,
   });
+
+  bool get fromReminder => reminderId != null && reminderId!.isNotEmpty;
 
   factory MedicationTask.fromFirestore(String id, Map<String, dynamic> data) {
     return MedicationTask(
@@ -27,6 +33,7 @@ class MedicationTask {
           ? (data['takenDateTime'] as Timestamp).toDate()
           : null,
       userId: data['userId'] ?? '',
+      reminderId: data['reminderId'] as String?,
     );
   }
 

@@ -13,6 +13,7 @@ import 'ui/screens/login_screen.dart';
 import 'services/tremor_provider.dart';
 import 'services/app_check_info.dart';
 import 'services/voice_assistant_service.dart';
+import 'services/reminder_service.dart';
 
 /// Token de depuración de App Check. Se inyecta SOLO en tiempo de compilación:
 ///   `flutter run --dart-define=APPCHECK_DEBUG_TOKEN=TOKEN_REGISTRADO_EN_LA_CONSOLA`
@@ -64,6 +65,8 @@ void main() async {
   await initializeDateFormatting('es_ES', null);
   // Precarga el modelo (Remote Config) sin bloquear el arranque.
   unawaited(VoiceAssistantService.instance.warmUp());
+  // Recordatorios de medicamentos: reprograma al abrir la app y al cambiar.
+  unawaited(ReminderService.instance.init().then((_) => ReminderService.instance.startSync()));
 
   runApp(
     MultiProvider(

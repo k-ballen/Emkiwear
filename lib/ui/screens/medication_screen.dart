@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:table_calendar/table_calendar.dart';
 import '../../services/firebase_service.dart';
+import '../../services/reminder_service.dart';
+import 'reminders_screen.dart';
 import '../../models/medication_task.dart';
 import '../widgets/assistant_button.dart';
 
@@ -193,6 +195,16 @@ class _MedicationScreenState extends State<MedicationScreen> {
         ),
         backgroundColor: Colors.purple.shade100,
         elevation: 0,
+        actions: [
+          // Solo ícono: con texto, el título grande + el botón se desbordaban.
+          IconButton(
+            tooltip: 'Recordatorios',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const RemindersScreen()),
+            ),
+            icon: const Icon(Icons.alarm, color: Colors.purple, size: 28),
+          ),
+        ],
       ),
       body: Container(
         decoration: BoxDecoration(
@@ -218,6 +230,28 @@ class _MedicationScreenState extends State<MedicationScreen> {
                   elevation: 4,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
                   textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                ),
+              ),
+            ),
+
+            // Acceso visible a los recordatorios
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+              child: OutlinedButton.icon(
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const RemindersScreen()),
+                ),
+                icon: const Icon(Icons.alarm),
+                label: const FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text('RECORDATORIOS Y ALARMAS', maxLines: 1),
+                ),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.purple,
+                  side: BorderSide(color: Colors.purple.shade200, width: 1.5),
+                  minimumSize: const Size(double.infinity, 50),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                  textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                 ),
               ),
             ),
@@ -274,6 +308,8 @@ class _MedicationScreenState extends State<MedicationScreen> {
                         task: task,
                         onToggle: (val) {
                           if (val != null) _firebaseService.updateTaskStatus(task.id, val);
+                          // Toma marcada en la app: cancela su aviso y su reaviso.
+                          if (val == true) ReminderService.instance.cancelDose(task.id);
                         },
                         onDelete: () => _confirmDelete(task),
                       );
