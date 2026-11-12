@@ -309,7 +309,10 @@ class TremorRepository {
   /// Devuelve false si no hay característica de control o la escritura falla
   /// (puede fallar si el reloj se apaga antes de confirmar).
   Future<bool> sendChargeModeCommand() async {
-    if (_cmdChar == null) return false;
+    if (_cmdChar == null) {
+      print("BLE: No se envió 0xC0: la característica de control aún no está disponible.");
+      return false;
+    }
     try {
       await _cmdChar!.write([cmdChargeMode]);
       return true;
@@ -322,6 +325,13 @@ class TremorRepository {
   void setCmdCharacteristic(BluetoothCharacteristic char) {
     _cmdChar = char;
   }
+
+  /// Al desconectar: la característica vieja ya no sirve para escribir.
+  void clearCmdCharacteristic() {
+    _cmdChar = null;
+  }
+
+  bool get hasCmdCharacteristic => _cmdChar != null;
 
   void dispose() {
     _sampleController.close();

@@ -172,6 +172,35 @@ class TremorProvider with ChangeNotifier {
   // Modo carga
   static const String _prefsChargeMode = 'charge_mode';
   static const String _prefsChargeModeStart = 'charge_mode_start_ms';
+  static const String _prefsChargeDevice = 'charge_mode_device_id';
+  static const String _prefsPreferredWatch = 'preferred_watch_id';
+
+  /// Reloj que se puso a cargar (el sondeo de 60 s solo busca ese).
+  String? _chargeDeviceId;
+
+  // ================= SELECTOR DE RELOJ =================
+
+  String? get preferredWatchId => _bleService.preferredDeviceId;
+  String? get connectedWatchId => _bleService.connectedDevice?.remoteId.str;
+
+  /// Busca todos los relojes cercanos (unos 6 s).
+  Future<List<WatchCandidate>> scanWatches() => _bleService.scanWatches();
+
+  /// Guarda el reloj elegido y se conecta a él (desconecta el actual).
+  Future<void> selectWatch(String id) async {
+    if (_chargeMode) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefsPreferredWatch, id);
+    } catch (_) {}
+    _logBleEvent("Reloj elegido por el usuario: $id");
+    // Nueva sesión de monitoreo con el otro reloj.
+    if (connectedWatchId != null && connectedWatchId != id) {
+      await closeMonitoringSession();
+    }
+    await _bleService.switchToDevice(id);
+    notifyListeners();
+  }
   bool _chargeMode = false;
   DateTime? _chargeModeStart;
   bool _enteringChargeMode = false;
@@ -583,7 +612,7 @@ class TremorProvider with ChangeNotifier {
     });
 
     FlutterBluePlus.events.onConnectionStateChanged.listen((event) {
-      if (event.device.platformName == "ParkinsonWatch") {
+      if (BleService.isWatchName(event.device.platformName)) {
         _connectionState = event.connectionState;
         if (_connectionState == BluetoothConnectionState.disconnected) {
           _batteryRaw = null;
@@ -622,6 +651,11 @@ class TremorProvider with ChangeNotifier {
   Future<void> _initConnection() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      _bleService.preferredDeviceId = prefs.getString(_prefsPreferredWatch);
+      _chargeDeviceId = prefs.getString(_prefsChargeDevice);
+      if (_bleService.preferredDeviceId != null) {
+        _logBleEvent("Reloj elegido: ${_bleService.preferredDeviceId}");
+      }
       if (prefs.getBool(_prefsChargeMode) ?? false) {
         final startMs = prefs.getInt(_prefsChargeModeStart);
         _chargeMode = true;
@@ -645,30 +679,45 @@ class TremorProvider with ChangeNotifier {
 
   /// Cierra la sesión de monitoreo: guarda y sincroniza lo pendiente para que el
   /// tiempo de carga no cuente como monitoreado ni genere ventanas vacías.
+  /// Guarda los bloques en el teléfono al instante y los sube a Firestore SIN
+  /// bloquear (antes el modo carga esperaba a Firestore y, si tardaba, nunca
+  /// llegaba a enviar 0xC0 mientras la reconexión seguía activa).
   Future<void> closeMonitoringSession() async {
     _isStreaming = false;
     _analyzingStartTime = null;
     try {
       await _saveBuckets();
-      await uploadSummary();
     } catch (e) {
-      print("TremorProvider: Error al cerrar sesión de monitoreo: $e");
+      print("TremorProvider: Error al guardar bloques: $e");
     }
-    _logBleEvent("Sesión de monitoreo cerrada (modo carga)");
+    unawaited(uploadSummary().catchError((e) {
+      print("TremorProvider: Error al subir bloques al cerrar sesión: $e");
+    }));
+    _logBleEvent("Sesión de monitoreo cerrada (bloques guardados; subida en segundo plano)");
   }
 
-  Future<void> enterChargeMode() async {
-    if (_chargeMode || _enteringChargeMode) return;
-    if (_connectionState != BluetoothConnectionState.connected) return;
+  /// true cuando el reloj está conectado Y la conexión terminó de armarse
+  /// (se le pueden enviar órdenes como 0xC0).
+  bool get watchReady =>
+      _connectionState == BluetoothConnectionState.connected && _bleService.isReady;
+
+  /// Devuelve null si entró en modo carga, o un mensaje de error para mostrar.
+  Future<String?> enterChargeMode() async {
+    if (_chargeMode || _enteringChargeMode) return null;
+    if (!watchReady) {
+      return 'El reloj todavía se está conectando. Espera unos segundos e inténtalo de nuevo.';
+    }
     _enteringChargeMode = true;
     notifyListeners();
+    final watchId = _bleService.connectedDevice?.remoteId.str;
 
     try {
-      // 1. Cerrar sesión de monitoreo (guardar + sincronizar)
-      await closeMonitoringSession();
-
-      // 2. Bloquear reconexión automática ANTES de que el reloj se apague
+      // 1. Bloquear la reconexión automática LO PRIMERO, antes de cualquier
+      //    espera, para que una desconexión no dispare reconexiones.
       _bleService.chargeMode = true;
+
+      // 2. Cerrar sesión de monitoreo (guarda local; sube en segundo plano)
+      await closeMonitoringSession();
 
       // 3. Escuchar 0xFF antes de escribir para no perder la notificación
       final ackFuture = _repository.batteryStream
@@ -676,7 +725,19 @@ class TremorProvider with ChangeNotifier {
           .timeout(const Duration(seconds: 3));
 
       // 4. Escribir 0xC0 en la característica de control (7A9B0004)
-      await _repository.sendChargeModeCommand();
+      final sent = await _repository.sendChargeModeCommand();
+      if (!sent) {
+        // La orden no llegó al reloj: NO se entra en modo carga (el reloj
+        // seguiría encendido y la app lo "encontraría" al minuto).
+        ackFuture.ignore();
+        _bleService.chargeMode = false;
+        _isStreaming = true;
+        _logBleEvent("No se pudo enviar 0xC0; no se entra en modo carga");
+        if (_bleService.connectedDevice == null) {
+          unawaited(_bleService.resumeNormalConnection());
+        }
+        return 'No se pudo enviar la orden al reloj. Verifica que esté cerca y conectado, e inténtalo de nuevo.';
+      }
 
       // 5. Esperar 0xFF (timeout 3 s). Si llega o hay timeout, continuar igual.
       try {
@@ -686,16 +747,21 @@ class TremorProvider with ChangeNotifier {
         _logBleEvent("Sin confirmación 0xFF en 3 s; se continúa");
       }
 
-      // 6. Persistir modo carga
+      // 6. Persistir modo carga (y QUÉ reloj se puso a cargar)
       _chargeMode = true;
       _chargeModeStart = DateTime.now();
+      _chargeDeviceId = watchId; // capturado antes: al apagarse ya no hay connectedDevice
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefsChargeMode, true);
       await prefs.setInt(_prefsChargeModeStart, _chargeModeStart!.millisecondsSinceEpoch);
+      if (_chargeDeviceId != null) {
+        await prefs.setString(_prefsChargeDevice, _chargeDeviceId!);
+      }
 
       // 7. Liberar la conexión sin disparar reconexión
       await _bleService.disconnectForChargeMode();
       _startChargeModeTimers();
+      return null;
     } finally {
       _enteringChargeMode = false;
       notifyListeners();
@@ -720,7 +786,9 @@ class TremorProvider with ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_prefsChargeMode);
       await prefs.remove(_prefsChargeModeStart);
+      await prefs.remove(_prefsChargeDevice);
     } catch (_) {}
+    _chargeDeviceId = null;
     _logBleEvent("Modo carga finalizado");
     notifyListeners();
   }
@@ -740,7 +808,12 @@ class TremorProvider with ChangeNotifier {
     if (!_chargeMode || _probeInProgress) return;
     _probeInProgress = true;
     try {
-      final device = await _bleService.probeScanForWatch(timeout: const Duration(seconds: 5));
+      // Solo el reloj que se puso a cargar: otro reloj encendido cerca no
+      // debe sacar a este del modo carga.
+      final device = await _bleService.probeScanForWatch(
+        timeout: const Duration(seconds: 5),
+        onlyId: _chargeDeviceId ?? _bleService.preferredDeviceId,
+      );
       if (device != null && _chargeMode) {
         _logBleEvent("Reloj detectado durante modo carga; reconectando");
         await _exitChargeMode();
@@ -961,11 +1034,15 @@ class TremorProvider with ChangeNotifier {
 
     bool hasFinishedBuckets = _buckets.keys.any((id) => id != currentBucketId);
 
-    if (hasFinishedBuckets) {
+    // Una sola subida a la vez: antes se lanzaba otra con cada STATUS (0,5 s)
+    // mientras la anterior seguía esperando a Firestore.
+    if (hasFinishedBuckets && !_uploadingSummary) {
       print("TremorProvider: Bloques terminados detectados. Subida automática...");
       uploadSummary();
     }
   }
+
+  bool _uploadingSummary = false;
 
   Future<void> _loadBuckets() async {
     final prefs = await SharedPreferences.getInstance();
@@ -985,6 +1062,16 @@ class TremorProvider with ChangeNotifier {
   }
 
   Future<void> uploadSummary() async {
+    if (_uploadingSummary) return;
+    _uploadingSummary = true;
+    try {
+      await _uploadSummaryInner();
+    } finally {
+      _uploadingSummary = false;
+    }
+  }
+
+  Future<void> _uploadSummaryInner() async {
     final bucketIds = _buckets.keys.toList();
     for (var id in bucketIds) {
       final acc = _buckets[id]!;
@@ -1019,7 +1106,13 @@ class TremorProvider with ChangeNotifier {
         taxonomyVersion: 2,
       );
 
-      await _firebaseService.addTremorSummary(summary);
+      // Firestore deja la escritura en su cola local aunque el servidor tarde en
+      // confirmar; no se espera indefinidamente.
+      try {
+        await _firebaseService.addTremorSummary(summary).timeout(const Duration(seconds: 8));
+      } on TimeoutException {
+        print("TremorProvider: Firestore sin confirmación del bloque $id; queda en cola local.");
+      }
 
       if (id != _getBucketId(DateTime.now())) {
         _buckets.remove(id);

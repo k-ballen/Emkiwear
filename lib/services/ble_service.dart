@@ -4,6 +4,24 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'tremor_repository.dart';
 import '../models/device_info.dart';
 
+/// Reloj encontrado en un escaneo (para el selector de reloj).
+class WatchCandidate {
+  final String id; // remoteId (MAC en Android)
+  final String name;
+  final int rssi;
+  final bool isConnected;
+
+  const WatchCandidate({
+    required this.id,
+    required this.name,
+    required this.rssi,
+    this.isConnected = false,
+  });
+
+  /// Últimos 5 caracteres de la MAC (p. ej. "C7:EE") para distinguir relojes.
+  String get shortId => id.length >= 5 ? id.substring(id.length - 5) : id;
+}
+
 class BleService {
   final TremorRepository repository;
   BluetoothDevice? _connectedDevice;
@@ -25,6 +43,13 @@ class BleService {
   StreamSubscription? _lastRawFifoSub;
 
   StreamSubscription? _lastBatterySub;
+  StreamSubscription? _lastSummarySub;
+  StreamSubscription? _lastCmdSub;
+
+  /// true cuando la conexión terminó de armarse (servicios descubiertos y
+  /// característica de control lista). Antes de eso no se pueden enviar órdenes.
+  bool _setupComplete = false;
+  bool get isReady => _connectedDevice != null && _setupComplete;
 
   bool _isConnecting = false;
   bool _isReconnecting = false;
@@ -35,6 +60,106 @@ class BleService {
   DeviceInfo? deviceInfo;
 
   BleService(this.repository);
+
+  /// Reloj elegido por el usuario (remoteId). Si es null, se conecta al primer
+  /// "ParkinsonWatch" que encuentre (comportamiento anterior).
+  String? preferredDeviceId;
+
+  /// Acepta "ParkinsonWatch" y variantes con sufijo (p. ej. "ParkinsonWatch-A").
+  static bool isWatchName(String name) => name.startsWith('ParkinsonWatch');
+
+  static String _nameOf(ScanResult r) {
+    final name = r.device.platformName;
+    return name.isNotEmpty ? name : r.advertisementData.localName;
+  }
+
+  /// ¿Este resultado es el reloj al que debemos conectarnos?
+  bool _isTargetWatch(ScanResult r, {String? onlyId}) {
+    if (!isWatchName(_nameOf(r))) return false;
+    final id = onlyId ?? preferredDeviceId;
+    return id == null || r.device.remoteId.str == id;
+  }
+
+  /// Escanea y devuelve TODOS los relojes cercanos (sin conectarse).
+  Future<List<WatchCandidate>> scanWatches({Duration timeout = const Duration(seconds: 6)}) async {
+    final found = <String, WatchCandidate>{};
+    final connected = _connectedDevice;
+    if (connected != null) {
+      found[connected.remoteId.str] = WatchCandidate(
+        id: connected.remoteId.str,
+        name: connected.platformName.isNotEmpty ? connected.platformName : 'ParkinsonWatch',
+        rssi: 0,
+        isConnected: true,
+      );
+    }
+    if (_isConnecting || _isProbeScanning) return found.values.toList();
+
+    try {
+      final adapter = await FlutterBluePlus.adapterState.first;
+      if (adapter != BluetoothAdapterState.on) return found.values.toList();
+    } catch (_) {}
+
+    _isProbeScanning = true;
+    StreamSubscription? sub;
+    try {
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      sub = FlutterBluePlus.onScanResults.listen((results) {
+        for (final r in results) {
+          final name = _nameOf(r);
+          final id = r.device.remoteId.str;
+          if (!isWatchName(name) || found[id]?.isConnected == true) continue;
+          found[id] = WatchCandidate(id: id, name: name, rssi: r.rssi);
+        }
+      }, onError: (e) => print("BLE Scan (selector) Error: $e"));
+      await FlutterBluePlus.startScan(timeout: timeout, androidUsesFineLocation: true);
+      await FlutterBluePlus.isScanning.where((s) => s == false).first
+          .timeout(timeout + const Duration(seconds: 2), onTimeout: () => false);
+    } catch (e) {
+      print("BLE: Error en escaneo del selector: $e");
+    } finally {
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      await sub?.cancel();
+      _isProbeScanning = false;
+    }
+
+    final list = found.values.toList()
+      ..sort((a, b) {
+        if (a.isConnected != b.isConnected) return a.isConnected ? -1 : 1;
+        return b.rssi.compareTo(a.rssi);
+      });
+    print("BLE: Relojes encontrados: ${list.map((w) => '${w.name} ${w.shortId} (${w.rssi} dBm)').join(', ')}");
+    return list;
+  }
+
+  /// Cambia al reloj [id]: desconecta el actual (sin reconexión automática) y
+  /// se conecta al nuevo.
+  Future<void> switchToDevice(String id) async {
+    preferredDeviceId = id;
+    final current = _connectedDevice;
+    if (current != null && current.remoteId.str == id) return;
+    if (current != null) {
+      _userDisconnected = true; // evita que la reconexión vuelva al reloj viejo
+      _isReconnecting = false;
+      try {
+        await current.disconnect();
+      } catch (_) {}
+      _cleanupConnection();
+      await Future.delayed(const Duration(milliseconds: 600));
+    }
+    _userDisconnected = false;
+    _lastDevice = null;
+    _lastDeviceId = id;
+    print("BLE: Cambiando al reloj $id...");
+    await connectToDevice(BluetoothDevice.fromId(id));
+    if (_connectedDevice == null) {
+      // No respondió de inmediato: queda la reconexión automática a ESTE reloj.
+      _startAutoReconnect();
+    }
+  }
 
   bool get chargeMode => _chargeMode;
   set chargeMode(bool value) {
@@ -56,7 +181,12 @@ class BleService {
   }
 
   /// Escaneo corto buscando el reloj. Devuelve el dispositivo si lo encuentra.
-  Future<BluetoothDevice?> probeScanForWatch({Duration timeout = const Duration(seconds: 5)}) async {
+  /// Con [onlyId] solo acepta ESE reloj (el que se puso a cargar), para no
+  /// confundirlo con otro reloj encendido cerca.
+  Future<BluetoothDevice?> probeScanForWatch({
+    Duration timeout = const Duration(seconds: 5),
+    String? onlyId,
+  }) async {
     if (_isProbeScanning || _isConnecting || _connectedDevice != null) return null;
     try {
       final adapter = await FlutterBluePlus.adapterState.first;
@@ -73,9 +203,7 @@ class BleService {
 
       sub = FlutterBluePlus.onScanResults.listen((results) {
         for (final r in results) {
-          String name = r.device.platformName;
-          if (name.isEmpty) name = r.advertisementData.localName;
-          if (name == "ParkinsonWatch" && !completer.isCompleted) {
+          if (_isTargetWatch(r, onlyId: onlyId) && !completer.isCompleted) {
             completer.complete(r.device);
             break;
           }
@@ -158,13 +286,13 @@ class BleService {
       await FlutterBluePlus.stopScan();
     } catch (_) {}
 
+    var handled = false;
     var subscription = FlutterBluePlus.onScanResults.listen((results) async {
       for (ScanResult r in results) {
-        String name = r.device.platformName;
-        if (name.isEmpty) name = r.advertisementData.localName;
-        
-        if (name == "ParkinsonWatch") {
-          print("BLE: ¡Dispositivo encontrado! ($name)");
+        // Con reloj elegido, solo ese; si no, el primer "ParkinsonWatch".
+        if (!handled && _isTargetWatch(r)) {
+          handled = true;
+          print("BLE: ¡Dispositivo encontrado! (${_nameOf(r)} ${r.device.remoteId.str})");
           await FlutterBluePlus.stopScan();
           await connectToDevice(r.device);
           break;
@@ -198,27 +326,17 @@ class BleService {
 
     try {
       print("BLE: Conectando a ${device.platformName} (${device.remoteId.str})...");
-      await device.connect(autoConnect: false);
+      // mtu: null -> flutter_blue_plus NO pide su MTU automático de 512 al
+      // conectar. Esa negociación extra (además de la de 247) hacía que el
+      // ESP32-C6 dejara de responder y la conexión cayera a los ~5 s
+      // (GATT_CONN_TIMEOUT, status 8).
+      await device.connect(autoConnect: false, mtu: null);
       _connectedDevice = device;
       _isConnecting = false;
 
-      // 1. Pedir MTU 247
-      try {
-        await device.requestMtu(247);
-        print("BLE: MTU 247 solicitado.");
-      } catch (e) {
-        print("BLE: Error MTU: $e");
-      }
-
-      // 2. En Android pedir prioridad de conexión alta
-      try {
-        await device.requestConnectionPriority(connectionPriorityRequest: ConnectionPriority.high);
-        print("BLE: Connection Priority High solicitada.");
-      } catch (e) {
-        print("BLE: Error Connection Priority: $e");
-      }
-
-      // 3. Suscripción a eventos de desconexión
+      // Suscripción a eventos de desconexión ANTES de negociar: si el reloj se
+      // cae durante el MTU, se limpia y se reintenta (antes quedaba "conectado").
+      await _connectionSubscription?.cancel();
       _connectionSubscription = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
           print("BLE: Desconectado de ${device.platformName}.");
@@ -228,6 +346,29 @@ class BleService {
           }
         }
       });
+
+      // Pequeña pausa para que el enlace se estabilice antes de negociar.
+      await Future.delayed(const Duration(milliseconds: 400));
+
+      // 1. En Android pedir prioridad de conexión alta (antes del MTU)
+      try {
+        await device.requestConnectionPriority(connectionPriorityRequest: ConnectionPriority.high);
+        print("BLE: Connection Priority High solicitada.");
+      } catch (e) {
+        print("BLE: Error Connection Priority: $e");
+      }
+
+      // 2. Una sola negociación de MTU (247). Si falla, se sigue con el MTU
+      //    por defecto: no debe tumbar la conexión.
+      try {
+        final mtu = await device.requestMtu(247, timeout: 5);
+        print("BLE: MTU negociado: $mtu");
+      } catch (e) {
+        print("BLE: Error MTU (se continúa con el MTU por defecto): $e");
+      }
+      if (_connectedDevice == null || !device.isConnected) {
+        throw StateError('El reloj se desconectó durante la negociación inicial');
+      }
 
       print("BLE: Descubriendo servicios...");
       List<BluetoothService> services = await device.discoverServices();
@@ -276,11 +417,19 @@ class BleService {
               }
             } else if (uuid == TremorRepository.summaryCharUuid) {
               await subscribeWithRetry(char);
-              char.onValueReceived.listen((value) async {
+              // Se guarda para cancelarlo al desconectar: flutter_blue_plus
+              // entrega los valores por UUID, así que un oyente viejo seguía
+              // recibiendo (y respondiendo ACK) en cada reconexión.
+              await _lastSummarySub?.cancel();
+              _lastSummarySub = char.onValueReceived.listen((value) async {
                 repository.decodeSummary(value, "actual_user");
                 if (value.length >= 2) {
                   int seq = value[0] | (value[1] << 8);
-                  await repository.sendSummaryAck(seq);
+                  try {
+                    await repository.sendSummaryAck(seq);
+                  } catch (e) {
+                    print("BLE: ACK de resumen no enviado: $e");
+                  }
                 }
               });
             } else if (uuid == TremorRepository.rawCharUuid) {
@@ -298,7 +447,8 @@ class BleService {
 
       if (cmdChar != null) {
         await subscribeWithRetry(cmdChar);
-        cmdChar.onValueReceived.listen((value) {
+        await _lastCmdSub?.cancel();
+        _lastCmdSub = cmdChar.onValueReceived.listen((value) {
           final text = utf8.decode(value, allowMalformed: true);
           if (text.startsWith("FW=")) {
             deviceInfo = DeviceInfo.parse(text);
@@ -309,13 +459,21 @@ class BleService {
           }
         });
 
-        Future.delayed(const Duration(seconds: 1), () {
-          repository.sendTimeSync();
-          repository.sendInfoRequest();
+        final connectedAt = _connectedDevice;
+        Future.delayed(const Duration(seconds: 1), () async {
+          // Si en ese segundo se desconectó, no se escribe (evita GATT_ERROR).
+          if (_connectedDevice == null || _connectedDevice != connectedAt) return;
+          try {
+            await repository.sendTimeSync();
+            await repository.sendInfoRequest();
+          } catch (e) {
+            print("BLE: Sincronización de hora/INFO no enviada: $e");
+          }
         });
       }
       
       print("BLE: Suscripciones iniciales completadas.");
+      _setupComplete = _connectedDevice != null && repository.hasCmdCharacteristic;
       _startFallbackReadCheck();
     } catch (e) {
       print("BLE Connection Error: $e");
@@ -426,6 +584,7 @@ class BleService {
   Future<void> _subscribeToRawFifo(BluetoothCharacteristic char) async {
     print("BLE: Suscribiendo a RAWFIFO...");
     await subscribeWithRetry(char);
+    await _lastRawFifoSub?.cancel(); // un solo oyente aunque llegue INFO varias veces
     _lastRawFifoSub = char.onValueReceived.listen((value) {
       repository.decodeRawFifo(value);
     });
@@ -442,6 +601,13 @@ class BleService {
     _lastRawSub?.cancel();
     _lastRawFifoSub?.cancel();
     _lastBatterySub?.cancel();
+    _lastSummarySub?.cancel();
+    _lastCmdSub?.cancel();
+    _lastSummarySub = null;
+    _lastCmdSub = null;
+    _lastRawFifoSub = null;
+    _setupComplete = false;
+    repository.clearCmdCharacteristic();
     _statusChar = null;
     _connectedDevice = null;
     _isConnecting = false;

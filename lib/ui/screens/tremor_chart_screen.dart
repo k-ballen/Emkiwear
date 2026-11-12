@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../services/tremor_provider.dart';
+import '../../services/ble_service.dart' show WatchCandidate;
 import '../../models/ble_device_data.dart';
 import '../widgets/assistant_button.dart';
 import 'debug_screen.dart';
@@ -107,6 +108,8 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
                 _buildChargeModeBanner(tremorProvider),
                 const SizedBox(height: 16),
               ] else ...[
+                _buildWatchSelectorRow(tremorProvider),
+                const SizedBox(height: 8),
                 _buildDeviceStatusRow(tremorProvider),
                 const SizedBox(height: 12),
               ],
@@ -172,7 +175,8 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
   // ESTADO DEL DISPOSITIVO: batería + botón "Modo carga"
   Widget _buildDeviceStatusRow(TremorProvider provider) {
     final isConnected = provider.connectionState == BluetoothConnectionState.connected;
-    final canEnter = isConnected && !provider.enteringChargeMode;
+    // Solo cuando la conexión terminó de armarse (si no, 0xC0 no se envía).
+    final canEnter = isConnected && provider.watchReady && !provider.enteringChargeMode;
 
     return Card(
       elevation: 2,
@@ -211,6 +215,143 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
     );
   }
 
+  // SELECTOR DE RELOJ: muestra a qué reloj está conectada la app y permite cambiarlo.
+  Widget _buildWatchSelectorRow(TremorProvider provider) {
+    final watchId = provider.connectedWatchId ?? provider.preferredWatchId;
+    final String label;
+    if (watchId == null) {
+      label = 'Reloj: automático (el primero que encuentre)';
+    } else {
+      final short = watchId.length >= 5 ? watchId.substring(watchId.length - 5) : watchId;
+      label = 'Reloj: …$short${provider.connectedWatchId == null ? ' (desconectado)' : ''}';
+    }
+
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+        child: Row(
+          children: [
+            const Icon(Icons.watch, color: Colors.purple, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(label, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+            ),
+            TextButton.icon(
+              onPressed: () => _showWatchPicker(provider),
+              icon: const Icon(Icons.swap_horiz, size: 18),
+              label: const Text('Cambiar'),
+              style: TextButton.styleFrom(foregroundColor: Colors.purple),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Hoja inferior con los relojes cercanos para elegir a cuál conectarse.
+  Future<void> _showWatchPicker(TremorProvider provider) async {
+    List<WatchCandidate>? watches;
+    bool scanning = false;
+
+    await showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          Future<void> scan() async {
+            setSheetState(() => scanning = true);
+            final result = await provider.scanWatches();
+            if (!sheetContext.mounted) return;
+            setSheetState(() {
+              watches = result;
+              scanning = false;
+            });
+          }
+
+          if (watches == null && !scanning) {
+            Future.microtask(scan);
+          }
+
+          String signal(int rssi) {
+            if (rssi == 0) return 'conectado';
+            if (rssi >= -60) return 'señal fuerte ($rssi dBm)';
+            if (rssi >= -80) return 'señal media ($rssi dBm)';
+            return 'señal débil ($rssi dBm)';
+          }
+
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Elegir reloj',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.purple),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Mantén encendidos los relojes y acércalos al teléfono. El elegido queda guardado.',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                  const SizedBox(height: 12),
+                  if (scanning)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 24),
+                      child: Center(child: CircularProgressIndicator(color: Colors.purple)),
+                    )
+                  else if (watches != null && watches!.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Text('No encontré relojes. Verifica que estén encendidos y con Bluetooth activo.'),
+                    )
+                  else if (watches != null)
+                    ...watches!.map((w) {
+                      final isPreferred = w.id == provider.preferredWatchId;
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          w.isConnected ? Icons.bluetooth_connected : Icons.watch,
+                          color: w.isConnected ? Colors.green : Colors.purple,
+                        ),
+                        title: Text('${w.name}  ·  …${w.shortId}'),
+                        subtitle: Text(signal(w.rssi)),
+                        trailing: isPreferred || w.isConnected
+                            ? const Icon(Icons.check_circle, color: Colors.green)
+                            : null,
+                        onTap: () async {
+                          Navigator.of(sheetContext).pop();
+                          if (!w.isConnected) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('Conectando al reloj …${w.shortId}')),
+                            );
+                          }
+                          // Si ya está conectado, solo queda guardado como el elegido.
+                          await provider.selectWatch(w.id);
+                        },
+                      );
+                    }),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: scanning ? null : scan,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Buscar de nuevo'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _confirmChargeMode(TremorProvider provider) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -235,7 +376,10 @@ class _TremorChartScreenState extends State<TremorChartScreen> {
       ),
     );
     if (confirmed == true) {
-      await provider.enterChargeMode();
+      final error = await provider.enterChargeMode();
+      if (error != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
+      }
     }
   }
 
