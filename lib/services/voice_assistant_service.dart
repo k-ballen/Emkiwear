@@ -10,6 +10,10 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'firebase_service.dart';
 import 'offline_speech_service.dart';
+import '../models/medication_reminder.dart';
+import '../models/medication_task.dart';
+import '../models/emergency_contact.dart';
+import 'call_service.dart';
 
 /// Callback invoked with the words recognized by the microphone and whether
 /// they are the final transcription for the current utterance.
@@ -19,6 +23,11 @@ typedef OnSpeechResult = void Function(String recognizedWords, bool isFinal);
 enum AppVoiceAction {
   none,
   openHome,
+  queryTremorToday,
+  queryMedicationToday,
+  openReminders,
+  emergency, // se siente mal: mostrar botones para llamar a sus contactos
+  callContact, // "llama a mi hija": abrir el marcador con ese número
   openTremor,
   openMedication,
   openHabits,
@@ -97,11 +106,23 @@ class VoiceAssistantResponse {
   final bool isRegistrationExecuted;
   final String? targetName;
 
+  /// Para openReminders: recordatorio prellenado con lo que dijo el usuario.
+  final MedicationReminder? reminderDraft;
+
+  /// Para emergency: contactos a mostrar como botones de llamada.
+  final List<EmergencyContact>? emergencyContacts;
+
+  /// Para callContact: número a marcar.
+  final String? phoneToCall;
+
   const VoiceAssistantResponse({
     required this.textResponse,
     this.action = AppVoiceAction.none,
     this.isRegistrationExecuted = false,
     this.targetName,
+    this.reminderDraft,
+    this.emergencyContacts,
+    this.phoneToCall,
   });
 }
 
@@ -168,9 +189,22 @@ class VoiceAssistantService {
   String get modelName => _modelName ?? defaultModelName;
 
   /// Precarga Remote Config y crea el modelo (se puede llamar al iniciar la app).
-  Future<void> warmUp() => _ensureModel();
+  Future<void> warmUp() async {
+    await _ensureModel();
+    unawaited(_profileMissingSummary());
+  }
 
   Future<void> _ensureModel() => _modelInit ??= _createModel();
+
+  /// Clave de Remote Config para el nivel de "razonamiento" del modelo:
+  /// minimal (por defecto, respuestas más rápidas), low, medium, high u off.
+  static const String remoteConfigThinkingKey = 'voice_thinking_level';
+  // 'minimal' no es aceptado por gemini-3.8-flash en Vertex AI ("Thinking level
+  // is unsupported: THINKING_LEVEL_MINIMAL"); 'low' sí y responde más rápido
+  // que el valor por defecto. Si tampoco lo aceptara, se desactiva solo.
+  static const String defaultThinkingLevel = 'low';
+  String _thinkingLevel = defaultThinkingLevel;
+  bool _thinkingDisabledByError = false;
 
   Future<void> _createModel() async {
     String name = defaultModelName;
@@ -181,7 +215,10 @@ class VoiceAssistantService {
         minimumFetchInterval:
             kDebugMode ? const Duration(minutes: 1) : const Duration(hours: 1),
       ));
-      await rc.setDefaults(const {remoteConfigModelKey: defaultModelName});
+      await rc.setDefaults(const {
+        remoteConfigModelKey: defaultModelName,
+        remoteConfigThinkingKey: defaultThinkingLevel,
+      });
       try {
         await rc.fetchAndActivate();
       } catch (e) {
@@ -189,21 +226,48 @@ class VoiceAssistantService {
       }
       final value = rc.getString(remoteConfigModelKey).trim();
       if (value.isNotEmpty) name = value;
+      final level = rc.getString(remoteConfigThinkingKey).trim().toLowerCase();
+      if (level.isNotEmpty) _thinkingLevel = level;
     } catch (e) {
       debugPrint('[Emki] Remote Config no disponible: $e');
     }
-
     _modelName = name;
+    _buildModel();
+  }
+
+  /// Nivel de razonamiento: los modelos Gemini 3 "piensan" antes de responder
+  /// y eso sumaba varios segundos (respuestas de 11-12 s). Para frases cortas
+  /// de voz basta el mínimo.
+  ThinkingConfig? get _thinkingConfig {
+    if (_thinkingDisabledByError) return null;
+    switch (_thinkingLevel) {
+      case 'minimal':
+        return ThinkingConfig.withThinkingLevel(ThinkingLevel.minimal);
+      case 'low':
+        return ThinkingConfig.withThinkingLevel(ThinkingLevel.low);
+      case 'medium':
+        return ThinkingConfig.withThinkingLevel(ThinkingLevel.medium);
+      case 'high':
+        return ThinkingConfig.withThinkingLevel(ThinkingLevel.high);
+      default:
+        return null; // 'off' u otro: el valor por defecto del modelo
+    }
+  }
+
+  void _buildModel() {
+    final name = _modelName ?? defaultModelName;
     // Backend Vertex AI ("Agent Platform Gemini API"). En firebase_ai 4.x,
     // FirebaseAI.vertexAI() está obsoleto y es un alias de agentPlatform()
     // (mismo backend). App Check se adjunta solo: app.getService<FirebaseAppCheck>().
+    final thinking = _thinkingConfig;
     _model = FirebaseAI.agentPlatform(location: 'global').generativeModel(
       model: name,
       systemInstruction: Content.system(_systemInstruction),
-      generationConfig: GenerationConfig(temperature: 0.2),
+      generationConfig: GenerationConfig(temperature: 0.2, thinkingConfig: thinking),
     );
     _chat = null;
-    debugPrint('[Emki] Modelo Vertex AI listo: $name (location: global)');
+    debugPrint('[Emki] Modelo Vertex AI listo: $name (location: global, '
+        'razonamiento: ${thinking == null ? 'por defecto' : _thinkingLevel})');
   }
 
   /// Reinicia la memoria de la conversación con Gemini.
@@ -402,7 +466,14 @@ class VoiceAssistantService {
       },
       onError: (error) {
         debugPrint('[Emki] STT error: ${error.errorMsg} (permanente: ${error.permanent})');
+        // En la ventana de continuación, "no te escuché" solo significa que la
+        // persona ya terminó: se envía lo acumulado.
+        if (_utteranceActive && _accumulated.isNotEmpty) {
+          _finishUtterance();
+          return;
+        }
         if (_retrySttWithNextLocale(error.errorMsg)) return;
+        _utteranceActive = false;
         _onError?.call(error.errorMsg);
       },
     );
@@ -451,6 +522,10 @@ class VoiceAssistantService {
     _currentListenDuration = duration;
     _currentOnResult = onResult;
     _sttLocaleQueue.clear();
+    _continuationTimer?.cancel();
+    _accumulated = '';
+    _utteranceActive = true;
+    _utteranceStart = DateTime.now();
 
     final online = await _hasInternet();
     if (online) {
@@ -480,16 +555,77 @@ class VoiceAssistantService {
   String _lastHeardText = '';
   bool _finalDelivered = true;
 
+  // --- Escucha continua ---
+  // El reconocedor de Android corta en cuanto detecta una pausa corta (a
+  // veces antes de que el paciente termine). Cuando cierra un tramo, se
+  // sigue escuchando [continuationWindow]: si la persona continúa, el texto
+  // nuevo se UNE al anterior; si se queda en silencio, se envía todo junto.
+  static const Duration continuationWindow = Duration(seconds: 3);
+  static const Duration maxUtterance = Duration(seconds: 40);
+  String _accumulated = '';
+  bool _utteranceActive = false;
+  DateTime? _utteranceStart;
+  Timer? _continuationTimer;
+
+  String _combined(String segment) =>
+      [_accumulated, segment.trim()].where((s) => s.isNotEmpty).join(' ');
+
+  /// ¿[current] es un tramo NUEVO y no una corrección/continuación de [previous]?
+  /// Una corrección conserva la primera palabra o no se acorta mucho.
+  @visibleForTesting
+  static bool isNewSegment(String previous, String current) {
+    final p = normalizeText(previous);
+    final c = normalizeText(current);
+    if (p.isEmpty || c.isEmpty) return false;
+    if (c.startsWith(p) || p.startsWith(c)) return false; // continuación o revisión
+    final sameFirstWord = p.split(' ').first == c.split(' ').first;
+    return !sameFirstWord && c.length < p.length * 0.8;
+  }
+
+  /// Un tramo terminó: se acumula y se sigue escuchando un momento más.
   void _deliverFinal(String text) {
     if (_finalDelivered || text.trim().isEmpty) return;
     _finalDelivered = true;
+    _accumulated = _combined(text);
+    debugPrint('[Emki] STT tramo: "$text" -> acumulado: "$_accumulated"');
+    // Se cierra la sesión (el modo sin conexión es CONTINUO y si no se cancela
+    // bloquea las escuchas siguientes con error_server_disconnected).
+    _cancelSpeechSession();
+    _currentOnResult?.call(_accumulated, false);
+
+    final elapsed = DateTime.now().difference(_utteranceStart ?? DateTime.now());
+    if (!_utteranceActive || elapsed > maxUtterance) {
+      _finishUtterance();
+      return;
+    }
+    _continuationTimer?.cancel();
+    _continuationTimer = Timer(continuationWindow, () {
+      debugPrint('[Emki] Silencio tras la frase: la envío.');
+      _finishUtterance();
+    });
+    final locale = _currentSttLocale;
+    Future.delayed(const Duration(milliseconds: 250), () {
+      if (_utteranceActive && locale != null) _startListeningWith(locale);
+    });
+  }
+
+  /// Termina la frase completa y la entrega al modal (también lo usa el botón
+  /// "TERMINÉ DE HABLAR").
+  void _finishUtterance() {
+    if (!_utteranceActive) return;
+    _utteranceActive = false;
+    _continuationTimer?.cancel();
+    // Si se estaba hablando un tramo nuevo, también cuenta lo ya oído.
+    final text = _finalDelivered ? _accumulated : _combined(_lastHeardText);
+    _finalDelivered = true;
+    _cancelSpeechSession();
+    if (text.trim().isEmpty) return;
     debugPrint('[Emki] STT frase final: "$text"');
-    // El reconocedor sin conexión es CONTINUO: si no se cancela sigue abierto
-    // en el servicio de Google y bloquea las escuchas siguientes
-    // (error_server_disconnected).
-    if (_currentSttOnDevice) _cancelSpeechSession();
     _currentOnResult?.call(text, true);
   }
+
+  /// Botón "TERMINÉ DE HABLAR": envía ya lo que se ha dicho.
+  void finishListening() => _finishUtterance();
 
   Future<void> _cancelSpeechSession() async {
     try {
@@ -510,6 +646,8 @@ class VoiceAssistantService {
       if (_speech.isListening) {
         debugPrint('[Emki] App en segundo plano: cancelo la escucha.');
         _finalDelivered = true;
+        _utteranceActive = false;
+        _continuationTimer?.cancel();
         _cancelSpeechSession();
       }
     }));
@@ -541,14 +679,24 @@ class VoiceAssistantService {
         if (_finalDelivered) return;
         final words = result.recognizedWords;
         if (words.trim().isNotEmpty) {
+          // El reconocedor en línea a veces, tras una pausa, sigue en la misma
+          // sesión pero REINICIA los parciales con la frase nueva (se perdía
+          // "Hoy desayuné..." y solo quedaba "a las 8 de la mañana"). Si el
+          // parcial nuevo no continúa el anterior, el anterior se guarda.
+          if (_lastHeardText.isNotEmpty && isNewSegment(_lastHeardText, words)) {
+            _accumulated = _combined(_lastHeardText);
+            debugPrint('[Emki] STT tramo (mismo micrófono): "$_lastHeardText" -> acumulado: "$_accumulated"');
+          }
           _lastHeardText = words;
           if (_currentSttOnDevice) _workingOfflineLocale = localeId;
+          // Siguió hablando dentro de la ventana: no se envía todavía.
+          _continuationTimer?.cancel();
         }
         if (result.finalResult) {
           // Un final vacío no borra lo que ya se oyó.
           _deliverFinal(words.trim().isNotEmpty ? words : _lastHeardText);
         } else if (words.trim().isNotEmpty) {
-          _currentOnResult?.call(words, false);
+          _currentOnResult?.call(_combined(words), false);
         }
       },
     );
@@ -603,6 +751,8 @@ class VoiceAssistantService {
   /// ignora stop(), y la sesión quedaba abierta bloqueando el micrófono.
   Future<void> stopListening() async {
     _finalDelivered = true; // al detener a mano no se entrega nada más
+    _utteranceActive = false;
+    _continuationTimer?.cancel();
     await _cancelSpeechSession();
   }
   Future<void> speak(String text) async => _tts.speak(text);
@@ -625,9 +775,24 @@ class VoiceAssistantService {
     }
     _chatLastUsed = now;
 
-    final GenerateContentResponse response = await _chat!
-        .sendMessage(Content.text(turnMessage))
-        .timeout(geminiTimeout);
+    final started = DateTime.now();
+    GenerateContentResponse response;
+    try {
+      response = await _chat!.sendMessage(Content.text(turnMessage)).timeout(geminiTimeout);
+    } catch (e) {
+      // Si el modelo no acepta el nivel de razonamiento, se quita y se reintenta una vez.
+      if (!_thinkingDisabledByError && _thinkingConfig != null &&
+          e.toString().toLowerCase().contains('thinking')) {
+        debugPrint('[Emki] El modelo no acepta thinkingLevel=$_thinkingLevel ($e); lo desactivo.');
+        _thinkingDisabledByError = true;
+        _buildModel();
+        _chat = _model!.startChat();
+        response = await _chat!.sendMessage(Content.text(turnMessage)).timeout(geminiTimeout);
+      } else {
+        rethrow;
+      }
+    }
+    debugPrint('[Emki] Gemini respondió en ${DateTime.now().difference(started).inMilliseconds} ms');
     final text = response.text?.trim() ?? '';
     if (text.isEmpty) throw StateError('Gemini devolvió una respuesta vacía');
     return text;
@@ -682,6 +847,36 @@ class VoiceAssistantService {
       resetChat();
     }
 
+    // Emergencia ("me siento mal", "me caí") o llamada ("llama a mi hija"):
+    // se resuelve aquí, sin Gemini: es lo más importante que sea rápido y fiable.
+    final emergencyResponse = await _handleEmergencyOrCall(cleanPrompt);
+    if (emergencyResponse != null) {
+      _pendingContext = null;
+      resetChat();
+      debugPrint('[Emergencia] "${emergencyResponse.textResponse}" acción=${emergencyResponse.action.name} '
+          'contactos=${emergencyResponse.emergencyContacts?.length ?? 0}');
+      await speak(emergencyResponse.textResponse);
+      return emergencyResponse;
+    }
+
+    // Recordatorio (aviso FUTURO): se resuelve aquí, sin Gemini, para que nunca
+    // se guarde como una toma ya hecha. Se abre el editor prellenado.
+    if (isReminderRequest(cleanPrompt)) {
+      _pendingContext = null;
+      resetChat();
+      final draft = extractReminderDraft(cleanPrompt, DateTime.now());
+      final response = VoiceAssistantResponse(
+        textResponse: reminderReply(draft),
+        action: AppVoiceAction.openReminders,
+        targetName: draft.name.isEmpty ? null : draft.name,
+        reminderDraft: draft,
+      );
+      debugPrint('[Emki] Recordatorio (local): "${response.textResponse}" '
+          'horas=${draft.times.length} días=${draft.weekdaysLabel} fin=${draft.endDate}');
+      await speak(response.textResponse);
+      return response;
+    }
+
     // Para reiniciar la sesión de chat cuando el contexto pendiente pasa a null.
     final bool hadPendingContext = _pendingContext != null;
 
@@ -697,10 +892,14 @@ class VoiceAssistantService {
       final formattedNow =
           '${nowTime.hour.toString().padLeft(2, '0')}:${nowTime.minute.toString().padLeft(2, '0')}';
 
+      // Campos vacíos del perfil (en caché; si aún no está, se carga para el próximo turno).
+      if (_profileMissingCache == null) unawaited(_profileMissingSummary());
+
       // Mensaje del turno: solo datos dinámicos. Las reglas van en systemInstruction.
       final turnMessage = '''
 HORA DE REFERENCIA DEL DISPOSITIVO: $formattedNow
 ESTADO CONVERSACIONAL PREVIO ACTIVO: ${_pendingContext != null ? _pendingContext!.toPromptContext() : "Sin contexto previo activo."}
+CAMPOS VACÍOS DEL PERFIL: ${_profileMissingCache ?? 'desconocido'}
 Mensaje del usuario: "$cleanPrompt"
 ''';
 
@@ -713,8 +912,17 @@ Mensaje del usuario: "$cleanPrompt"
       debugPrint('[Emki] Gemini error: $e\n$st');
       detectedAction = _detectActionFromPrompt(cleanPrompt);
       targetName = _extractCommunityTargetName(cleanPrompt, detectedAction);
-      final fallback = await _tryLocalRegistrationFallback(cleanPrompt);
-      if (fallback != null) {
+      // Las consultas del día se responden más abajo con datos reales; no
+      // pasan por el respaldo de registro.
+      final fallback = _isDayQuery(detectedAction)
+          ? null
+          : await _tryLocalRegistrationFallback(cleanPrompt);
+      if (detectedAction == AppVoiceAction.openReminders) {
+        targetName = extractReminderMedication(cleanPrompt);
+        rawReply = _getFallbackResponse(cleanPrompt, detectedAction, targetName);
+      } else if (_isDayQuery(detectedAction)) {
+        rawReply = '';
+      } else if (fallback != null) {
         rawReply = fallback.reply;
         localRegistered = fallback.registered;
       } else {
@@ -747,7 +955,21 @@ Mensaje del usuario: "$cleanPrompt"
     }
 
     // Parse navigation action tag from AI reply
-    if (rawReply.contains('[ACTION:OPEN_HOME]')) {
+    final reminderTag =
+        RegExp(r'\[ACTION:OPEN_REMINDERS(?:\|name=([^\]]*))?\]').firstMatch(rawReply);
+    if (rawReply.contains('[ACTION:EMERGENCY]')) {
+      detectedAction = AppVoiceAction.emergency;
+    } else if (reminderTag != null) {
+      detectedAction = AppVoiceAction.openReminders;
+      final tagName = reminderTag.group(1)?.trim();
+      targetName = (tagName != null && tagName.isNotEmpty)
+          ? _cleanEntityName(tagName)
+          : extractReminderMedication(cleanPrompt);
+    } else if (rawReply.contains('[ACTION:QUERY_TREMOR_TODAY]')) {
+      detectedAction = AppVoiceAction.queryTremorToday;
+    } else if (rawReply.contains('[ACTION:QUERY_MEDS_TODAY]')) {
+      detectedAction = AppVoiceAction.queryMedicationToday;
+    } else if (rawReply.contains('[ACTION:OPEN_HOME]')) {
       detectedAction = AppVoiceAction.openHome;
     } else if (rawReply.contains('[ACTION:OPEN_MEDICATION]')) {
       detectedAction = AppVoiceAction.openMedication;
@@ -839,6 +1061,36 @@ Mensaje del usuario: "$cleanPrompt"
       targetName ??= _extractCommunityTargetName(cleanPrompt, detectedAction);
     }
 
+    // Perfil: [UPDATE_PROFILE|...] de Gemini o, sin Gemini, el extractor local.
+    final profileTag = RegExp(r'\[UPDATE_PROFILE\|([^\]]+)\]').firstMatch(rawReply);
+    final profileUpdates = profileTag != null
+        ? parseProfileTag(profileTag.group(1)!)
+        : (!_lastReplyFromGemini ? extractProfileUpdates(cleanPrompt) : const <String, Object>{});
+    if (profileUpdates.isNotEmpty) {
+      await _saveOfflineSafe(_firebaseService.updateProfileFields(profileUpdates));
+      _profileMissingCache = null; // se recalcula con los datos nuevos
+      _pendingContext = null;
+      debugPrint('[Emki] Perfil actualizado: $profileUpdates');
+      // Si Gemini preguntó por el siguiente dato, se conserva su pregunta.
+      final geminiText = rawReply.replaceAll(RegExp(r'\[[^\]]*\]'), '').trim();
+      rawReply = profileUpdateReply(profileUpdates);
+      if (_lastReplyFromGemini && geminiText.contains('?')) {
+        final question = geminiText.substring(geminiText.lastIndexOf(RegExp(r'[.!]\s')) + 1).trim();
+        if (question.endsWith('?')) rawReply = rawReply.replaceFirst(' Te abro tu perfil para que lo revises.', ' $question');
+      }
+      detectedAction = rawReply.contains('Te abro tu perfil') ? AppVoiceAction.openProfile : AppVoiceAction.none;
+    }
+
+    // Consultas del día: la respuesta se arma EN EL CÓDIGO con datos reales
+    // (no con lo que diga Gemini) y después se abre la sección.
+    if (detectedAction == AppVoiceAction.queryTremorToday) {
+      _pendingContext = null;
+      rawReply = await _buildTremorTodayReply();
+    } else if (detectedAction == AppVoiceAction.queryMedicationToday) {
+      _pendingContext = null;
+      rawReply = await _buildMedicationsTodayReply();
+    }
+
     // Completely strip ALL technical tags before UI rendering or TTS speech!
     final cleanReply = rawReply
         .replaceAll(RegExp(r'\[ACTION:[A-Z_]+\]'), '')
@@ -850,6 +1102,10 @@ Mensaje del usuario: "$cleanPrompt"
         .replaceAll(RegExp(r'(?<!\.)\.\s*\.(?!\.)'), '.')
         .trim();
 
+    // Gemini detectó una emergencia con otras palabras: botones de llamada.
+    final emergencyContacts =
+        detectedAction == AppVoiceAction.emergency ? await _loadEmergencyContacts() : null;
+
     final finalResponse = VoiceAssistantResponse(
       textResponse: cleanReply.isNotEmpty
           ? cleanReply
@@ -857,6 +1113,7 @@ Mensaje del usuario: "$cleanPrompt"
       action: detectedAction,
       isRegistrationExecuted: regResult.executed || localRegistered,
       targetName: targetName,
+      emergencyContacts: emergencyContacts,
     );
 
     debugPrint('[Emki] Respuesta (${_lastReplyFromGemini ? "Gemini" : "respaldo local"}): '
@@ -1089,6 +1346,11 @@ Mensaje del usuario: "$cleanPrompt"
     final action = _detectActionFromPrompt(prompt);
     const strong = {
       AppVoiceAction.openHome,
+      AppVoiceAction.queryTremorToday,
+      AppVoiceAction.queryMedicationToday,
+      AppVoiceAction.openReminders,
+      AppVoiceAction.emergency,
+      AppVoiceAction.callContact,
       AppVoiceAction.openTremor,
       AppVoiceAction.openCommunity,
       AppVoiceAction.openCommunityCompanions,
@@ -1557,6 +1819,676 @@ Mensaje del usuario: "$cleanPrompt"
     return name[0].toUpperCase() + name.substring(1);
   }
 
+  // ================= CONSULTAS DEL DÍA (FASE 5) =================
+
+  static bool _isDayQuery(AppVoiceAction a) =>
+      a == AppVoiceAction.queryTremorToday ||
+      a == AppVoiceAction.queryMedicationToday ||
+      a == AppVoiceAction.openReminders; // tampoco pasa por el respaldo de registro
+
+  /// "Quiero poner un recordatorio para tomar la amoxicilina", "recuérdame la
+  /// levodopa", "prográmame una alarma de mis pastillas" -> openReminders.
+  @visibleForTesting
+  static bool isReminderRequest(String prompt) {
+    final n = normalizeText(prompt);
+    if (hasAnyWord(n, const [
+      'recordatorio', 'recordatorios', 'recuerdame', 'recordarme', 'recuerdeme',
+      'alarma', 'alarmas', 'avisame', 'avisarme', 'notificacion', 'notificaciones',
+    ])) {
+      return true;
+    }
+    return hasAnyWord(n, const ['programa', 'programar', 'programame']) &&
+        hasAnyWord(n, _medicationWords);
+  }
+
+  static const Map<String, int> _weekdayWords = {
+    'lunes': 1, 'martes': 2, 'miercoles': 3, 'jueves': 4, 'viernes': 5,
+    'sabado': 6, 'sabados': 6, 'domingo': 7, 'domingos': 7,
+  };
+
+  /// Borrador de recordatorio a partir de la frase (para prellenar el editor):
+  /// medicamento, horas ("a las 8 y a las 8 de la noche", "cada 8 horas"),
+  /// días ("todos los días", "lunes y jueves", "entre semana") y duración
+  /// ("durante 7 días", "por 2 semanas"). Lo que no se diga queda vacío.
+  @visibleForTesting
+  static MedicationReminder extractReminderDraft(String prompt, DateTime now) {
+    final n = normalizeText(prompt);
+    final today = DateTime(now.year, now.month, now.day);
+
+    // --- Horas ---
+    final times = <TimeOfDay>[];
+    void addTime(int hour, int minute) {
+      if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return;
+      if (times.any((t) => t.hour == hour && t.minute == minute)) return;
+      times.add(TimeOfDay(hour: hour, minute: minute));
+    }
+
+    // "ahorita", "hoy", "en un rato": la hora sin a. m./p. m. es la próxima.
+    final soonish = hasAnyWord(n, const [
+      'ahorita', 'ahora', 'hoy', 'en un rato', 'dentro de', 'mas tarde', 'esta tarde', 'esta noche',
+    ]);
+    final clock = RegExp('(?:^| )(?:a las?|y las?) (\\d{1,2}|[a-z]+)(?: (\\d{2}))?'
+        '(?: (y media|y cuarto|menos cuarto))?(?: ($_periodPattern))?(?= |\$)');
+    for (final m in clock.allMatches(n)) {
+      final h0 = _parseNumber(m.group(1)!);
+      if (h0 == null || h0 > 23) continue;
+      var hour = h0;
+      var minute = m.group(2) != null ? int.parse(m.group(2)!) : 0;
+      final frac = m.group(3);
+      if (frac == 'y media') minute = 30;
+      if (frac == 'y cuarto') minute = 15;
+      if (frac == 'menos cuarto') {
+        minute = 45;
+        hour = (hour + 23) % 24;
+      }
+      final period = m.group(4);
+      if (period != null) {
+        final pm = period == 'pm' || period == 'p m' || period.contains('tarde') || period.contains('noche');
+        if (pm && hour < 12) hour += 12;
+        if (!pm && hour == 12) hour = 0;
+      } else if (soonish && hour >= 1 && hour <= 11) {
+        // "ahorita a las 4:55" dicho a las 4:53 p. m. -> 16:55, no 4:55 a. m.:
+        // la próxima vez que llegue esa hora.
+        final nowMin = now.hour * 60 + now.minute;
+        if (hour * 60 + minute < nowMin && (hour + 12) * 60 + minute >= nowMin) hour += 12;
+      }
+      addTime(hour, minute);
+    }
+
+    // "cada 8 horas" -> desde la primera hora dicha (o 8:00) hasta completar el día
+    final every = RegExp(r'(?:^| )cada (\d{1,2}|[a-z]+) horas?(?= |$)').firstMatch(n);
+    final step = every != null ? _parseNumber(every.group(1)!) : null;
+    if (step != null && step >= 1 && step <= 12) {
+      final first = times.isNotEmpty ? times.first : const TimeOfDay(hour: 8, minute: 0);
+      var minutes = first.hour * 60 + first.minute;
+      for (var i = 0; i < 24 ~/ step; i++) {
+        addTime((minutes ~/ 60) % 24, minutes % 60);
+        minutes += step * 60;
+      }
+    }
+    times.sort((a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute));
+
+    // --- Días ---
+    final weekdays = <int>{};
+    if (hasAnyWord(n, const ['entre semana', 'dias de semana', 'de lunes a viernes'])) {
+      weekdays.addAll([1, 2, 3, 4, 5]);
+    } else if (hasAnyWord(n, const ['fines de semana', 'fin de semana'])) {
+      weekdays.addAll([6, 7]);
+    } else if (!hasAnyWord(n, const ['todos los dias', 'diario', 'diariamente', 'cada dia'])) {
+      _weekdayWords.forEach((w, d) {
+        if (hasWord(n, w)) weekdays.add(d);
+      });
+    }
+
+    // --- Duración ---
+    DateTime? endDate;
+    final dur = RegExp(r'(?:^| )(?:durante|por) (\d{1,3}|[a-z]+) (dia|dias|semana|semanas|mes|meses)(?= |$)')
+        .firstMatch(n);
+    final amount = dur != null ? _parseNumber(dur.group(1)!) : null;
+    if (amount != null && amount > 0) {
+      final unit = dur!.group(2)!;
+      final days = unit.startsWith('dia') ? amount : unit.startsWith('semana') ? amount * 7 : amount * 30;
+      endDate = today.add(Duration(days: days - 1));
+    }
+
+    return MedicationReminder(
+      id: '',
+      name: extractReminderMedication(prompt) ?? '',
+      times: times,
+      weekdays: weekdays.toList()..sort(),
+      startDate: today,
+      endDate: endDate,
+    );
+  }
+
+  /// Respuesta hablada para un pedido de recordatorio.
+  static String reminderReply(MedicationReminder d) {
+    String fmt(TimeOfDay t) {
+      final h12 = t.hourOfPeriod == 0 ? 12 : t.hourOfPeriod;
+      return '$h12:${t.minute.toString().padLeft(2, '0')} ${t.period == DayPeriod.am ? 'a. m.' : 'p. m.'}';
+    }
+
+    final parts = <String>[];
+    if (d.name.isNotEmpty) parts.add('de ${d.name}');
+    if (d.times.isNotEmpty) {
+      final ts = d.times.map(fmt).toList();
+      parts.add(ts.length == 1
+          ? 'a las ${ts.first}'
+          : 'a las ${ts.sublist(0, ts.length - 1).join(', ')} y ${ts.last}');
+    }
+    if (d.weekdays.isNotEmpty) parts.add(d.weekdaysLabel.toLowerCase());
+    if (d.endDate != null) {
+      final days = d.endDate!.difference(d.startDate).inDays + 1;
+      parts.add('durante $days ${days == 1 ? 'día' : 'días'}');
+    }
+    final what = parts.isEmpty ? '' : ' ${parts.join(', ')}';
+    final missing = <String>[
+      if (d.name.isEmpty) 'el medicamento',
+      if (d.times.isEmpty) 'las horas',
+    ];
+    final ask = missing.isEmpty
+        ? 'Revisa los datos y toca Guardar.'
+        : 'Completa ${missing.join(' y ')} y toca Guardar.';
+    final head = 'Te abro el recordatorio$what';
+    return '${head.endsWith('.') ? head : '$head.'} $ask'; // sin "a. m.."
+  }
+
+  /// Medicamento mencionado en un pedido de recordatorio (o null).
+  @visibleForTesting
+  static String? extractReminderMedication(String prompt) {
+    final fromVerb = extractItemName(prompt, 'medication');
+    if (fromVerb != null && !_genericItemNames.contains(normalizeText(fromVerb))) {
+      return fromVerb;
+    }
+    // "recuérdame la levodopa", "recordatorio de amoxicilina"
+    final m = RegExp(
+      r'(?:recuerdame|recordarme|recuerdeme|recordatorio|alarma|avisame)'
+      r'(?: de| para| que)?(?: tomar| tome| tomarme)?(?: la| el| mi| mis| las| los)?'
+      r' ([a-zñ0-9 ]+?)(?= a las| todos| cada| por la| en la| hoy| manana| mañana|$)',
+    ).firstMatch(normalizeText(prompt));
+    final raw = m?.group(1)?.trim();
+    if (raw == null || raw.isEmpty) return null;
+    var words = raw.split(' ');
+    // Lo que viene después del último "tomar/tome" ("que me tengo que tomar la X").
+    final lastTake = words.lastIndexWhere((w) => const {'tomar', 'tome', 'tomarme', 'tomo'}.contains(w));
+    if (lastTake >= 0) words = words.sublist(lastTake + 1);
+    const filler = {'tengo', 'debo', 'quiero', 'poner', 'pon', 'hay', 'necesito'};
+    words = words.where((w) => !_leadingNoise.contains(w) && !filler.contains(w)).toList();
+    if (words.isEmpty) return null;
+    final normName = words.join(' ');
+    if (_genericItemNames.contains(normName)) return null;
+
+    // Recupera las palabras como se dijeron (con tildes): "losartán", no "losartan".
+    final original = prompt
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), ' ')
+        .trim()
+        .split(' ');
+    final norm = original.map(normalizeText).toList();
+    for (var i = 0; i + words.length <= norm.length; i++) {
+      if (norm.sublist(i, i + words.length).join(' ') == normName) {
+        final name = original.sublist(i, i + words.length).join(' ');
+        return name[0].toUpperCase() + name.substring(1);
+      }
+    }
+    return normName[0].toUpperCase() + normName.substring(1);
+  }
+
+  /// "¿Cómo ha estado mi temblor hoy?" -> queryTremorToday;
+  /// "¿Qué medicamentos tengo hoy?" -> queryMedicationToday; si no, none.
+  /// Una frase de registro ("me tomé...") nunca es consulta.
+  @visibleForTesting
+  static AppVoiceAction detectDayQuery(String prompt) {
+    final n = normalizeText(prompt);
+    if (hasAnyWord(n, const [
+      'tome', 'me tome', 'ya tome', 'comi', 'desayune', 'almorce', 'cene',
+      'camine', 'registra', 'registrar', 'anota', 'apunta',
+    ])) {
+      return AppVoiceAction.none;
+    }
+    // Pregunta: palabra interrogativa AL INICIO ("siento que tengo temblor" no
+    // es pregunta) o un verbo de consulta en cualquier parte.
+    final start = n.replaceFirst(RegExp(r'^(?:oye |hola |emki |oye emki |por favor )+'), '');
+    final firstWord = start.split(' ').first;
+    final asks = const {
+          'como', 'que', 'cuales', 'cual', 'cuantas', 'cuantos', 'cuanto', 'cuanta',
+        }.contains(firstWord) ||
+        hasAnyWord(n, const ['resumen', 'dime', 'cuentame', 'revisa', 'consulta', 'muestrame', 'quiero saber']);
+    if (!asks) return AppVoiceAction.none;
+
+    if (hasAnyWord(n, const ['temblor', 'temblores', 'tiemblo', 'temblado'])) {
+      if (hasAnyWord(n, const [
+        'hoy', 'dia', 'ha estado', 'he estado', 'como va', 'como voy',
+        'como estuvo', 'como esta', 'resumen', 'cuanto', 'cuanta',
+      ])) {
+        return AppVoiceAction.queryTremorToday;
+      }
+    }
+    if (hasAnyWord(n, const [
+      'medicamento', 'medicamentos', 'medicina', 'medicinas', 'pastilla',
+      'pastillas', 'remedio', 'remedios', 'dosis', 'tomas',
+    ])) {
+      if (hasAnyWord(n, const [
+        'hoy', 'tengo', 'me toca', 'me tocan', 'me falta', 'me faltan',
+        'pendiente', 'pendientes', 'debo tomar', 'tengo que tomar', 'faltan',
+      ])) {
+        return AppVoiceAction.queryMedicationToday;
+      }
+    }
+    return AppVoiceAction.none;
+  }
+
+  static const String _noDataConnection =
+      'No pude consultar tus datos ahora mismo. Te abro la sección para que los revises.';
+
+  /// "12 minutos", "1 hora y 5 minutos", "menos de un minuto".
+  static String _fmtMinutes(double minutes) {
+    final total = minutes.round();
+    if (minutes < 1) return 'menos de un minuto';
+    if (total < 60) return total == 1 ? '1 minuto' : '$total minutos';
+    final h = total ~/ 60;
+    final m = total % 60;
+    final hs = h == 1 ? '1 hora' : '$h horas';
+    if (m == 0) return hs;
+    return '$hs y ${m == 1 ? '1 minuto' : '$m minutos'}';
+  }
+
+  /// Resumen de temblor de hoy con datos de tremor_summaries. Sin diagnóstico.
+  Future<String> _buildTremorTodayReply() async {
+    if (!await _hasInternet()) return _noDataConnection;
+    try {
+      final s = await _firebaseService.getTodayTremorSummary();
+      if (s == null || s.totalSamples == 0) {
+        return 'Hoy todavía no tengo datos de temblor registrados. Usa el reloj un rato '
+            'y vuelve a preguntarme. Te abro la sección de temblor.';
+      }
+      final monitored = _fmtMinutes(s.monitoredMinutes);
+      final tremor = s.tremorMinutes;
+      if (tremor < 0.5) {
+        return 'Hoy el reloj te ha monitoreado $monitored y no detectó temblor '
+            'parkinsoniano. Te abro la sección de temblor.';
+      }
+      final pct = (tremor / s.monitoredMinutes * 100).round();
+      final parts = <String>[
+        if (s.count('LEVE') > 0) '${_fmtMinutes(s.minutesOf('LEVE'))} leve',
+        if (s.count('MODERADO') > 0) '${_fmtMinutes(s.minutesOf('MODERADO'))} moderado',
+        if (s.count('GRAVE') > 0) '${_fmtMinutes(s.minutesOf('GRAVE'))} grave',
+      ];
+      final detail = parts.length > 1
+          ? '${parts.sublist(0, parts.length - 1).join(', ')} y ${parts.last}'
+          : parts.first;
+      final buffer = StringBuffer(
+        'Hoy el reloj te ha monitoreado $monitored. Tuviste temblor durante '
+        '${_fmtMinutes(tremor)}, cerca del $pct por ciento del tiempo: $detail.',
+      );
+      if (s.count('GRAVE') > 0) {
+        buffer.write(' Hubo momentos de temblor grave; te sugiero comentarlo con tu médico.');
+      }
+      buffer.write(' Te abro la sección de temblor para que veas el detalle.');
+      return buffer.toString();
+    } catch (e) {
+      debugPrint('[Emki] No se pudo consultar el temblor de hoy: $e');
+      return _noDataConnection;
+    }
+  }
+
+  /// Tomas de medicamento de hoy (medication_tasks), tomadas y pendientes.
+  Future<String> _buildMedicationsTodayReply() async {
+    if (!await _hasInternet()) return _noDataConnection;
+    try {
+      final registered = await _firebaseService.getTodayMedications();
+      // Tomas de hoy de los recordatorios que aún no se han marcado (los
+      // recordatorios no crean tomas hasta que se toca "Ya la tomé").
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
+      final takenIds = registered.map((t) => t.id).toSet();
+      final reminderDoses = <MedicationTask>[];
+      try {
+        final reminders = await _firebaseService.getReminders().timeout(const Duration(seconds: 6));
+        for (final r in reminders) {
+          for (final dose in r.dosesBetween(today, 1)) {
+            final id = r.doseTaskId(dose);
+            if (takenIds.contains(id)) continue;
+            reminderDoses.add(MedicationTask(
+              id: id,
+              name: r.dose != null ? '${r.name} (${r.dose})' : r.name,
+              scheduledDateTime: dose,
+              userId: '',
+              reminderId: r.id,
+            ));
+          }
+        }
+      } catch (e) {
+        debugPrint('[Emki] No pude leer los recordatorios de hoy: $e');
+      }
+      final tasks = [...registered, ...reminderDoses]
+        ..sort((a, b) => a.scheduledDateTime.compareTo(b.scheduledDateTime));
+      if (tasks.isEmpty) {
+        return 'No tienes medicamentos programados para hoy. Te abro la sección de medicamentos.';
+      }
+      String timeOf(DateTime d) => _formatTimeDisplay(TimeOfDay(hour: d.hour, minute: d.minute));
+      final pending = tasks.where((t) => !t.isTaken).toList();
+      final shown = tasks.take(6).map((t) =>
+          '${t.name} a las ${timeOf(t.scheduledDateTime)}${t.isTaken ? ', ya tomada' : ''}');
+      final buffer = StringBuffer(
+        'Hoy tienes ${tasks.length == 1 ? 'una toma' : '${tasks.length} tomas'}: ${shown.join('; ')}'
+        '${tasks.length > 6 ? '; y otras más' : ''}.',
+      );
+      if (pending.isEmpty) {
+        buffer.write(' Ya marcaste todas como tomadas. ¡Muy bien!');
+      } else {
+        final next = pending.first;
+        buffer.write(' Te ${pending.length == 1 ? 'falta una' : 'faltan ${pending.length}'}; '
+            'la próxima es ${next.name} a las ${timeOf(next.scheduledDateTime)}.');
+      }
+      buffer.write(' Te abro la sección de medicamentos.');
+      return buffer.toString();
+    } catch (e) {
+      debugPrint('[Emki] No se pudo consultar los medicamentos de hoy: $e');
+      return _noDataConnection;
+    }
+  }
+
+  // ================= EMERGENCIA Y LLAMADAS =================
+
+  static const List<String> _distressPhrases = [
+    'me siento mal', 'me siento muy mal', 'me siento fatal', 'me siento peor',
+    'me siento muy debil', 'me cai', 'me he caido', 'me caido', 'me fui al piso',
+    'auxilio', 'emergencia', 'no puedo respirar', 'me cuesta respirar',
+    'me falta el aire', 'me duele el pecho', 'dolor en el pecho',
+    'me voy a desmayar', 'me desmaye', 'estoy mareado', 'estoy mareada',
+    'me mareo', 'no me puedo levantar', 'no puedo levantarme',
+    'necesito ayuda urgente', 'ayuda urgente',
+  ];
+
+  /// ¿La persona dice que se siente mal o está en peligro?
+  /// "ayuda" sola solo cuenta en frases cortas ("¡ayuda!"), no en
+  /// "ayúdame a registrar mi comida".
+  @visibleForTesting
+  static bool isDistress(String prompt) {
+    final n = normalizeText(prompt);
+    if (hasAnyWord(n, _distressPhrases)) return true;
+    final shortAsk = n.split(' ').length <= 3;
+    return shortAsk && hasAnyWord(n, const ['ayuda', 'ayudame', 'socorro']);
+  }
+
+  /// "llama a mi hija" -> "mi hija"; null si no es un pedido de llamada.
+  @visibleForTesting
+  static String? callTargetPhrase(String prompt) {
+    final n = normalizeText(prompt);
+    final m = RegExp(r'^(?:oye |emki |por favor )*(?:llama|llamame|llamale|llamar|marca|marcale|marcar|'
+            r'comunicame con|contacta|contactar|puedes llamar|quiero llamar|necesito llamar)(?: a| al)? (.+)$')
+        .firstMatch(n);
+    return m?.group(1)?.trim();
+  }
+
+  static const Set<String> _relationWords = {
+    'hija', 'hijo', 'esposa', 'esposo', 'mama', 'papa', 'madre', 'padre',
+    'hermana', 'hermano', 'nieta', 'nieto', 'sobrina', 'sobrino', 'cuidador',
+    'cuidadora', 'enfermera', 'enfermero', 'vecina', 'vecino', 'amiga', 'amigo',
+    'novia', 'novio', 'pareja', 'doctor', 'doctora', 'tia', 'tio',
+  };
+
+  /// Contacto que coincide con lo pedido ("mi hija", "María", "contacto de
+  /// emergencia"). "123", "ambulancia" o "emergencias" -> línea 123.
+  @visibleForTesting
+  static EmergencyContact? matchContact(String target, List<EmergencyContact> contacts) {
+    final t = normalizeText(target);
+    if (hasAnyWord(t, const ['123', 'ambulancia', 'emergencias', 'linea de emergencia', 'policia', 'bomberos'])) {
+      return const EmergencyContact(name: 'Línea de emergencias', phone: CallService.emergencyNumber);
+    }
+    if (contacts.isEmpty) return null;
+    // 1. Por nombre (palabra completa)
+    for (final c in contacts) {
+      final first = normalizeText(c.name).split(' ').first;
+      if (first.isNotEmpty && hasWord(t, first)) return c;
+    }
+    // 2. Por parentesco ("mi hija")
+    for (final c in contacts) {
+      final rel = normalizeText(c.relation);
+      if (rel.isNotEmpty && (hasWord(t, rel) || rel.split(' ').any((w) => _relationWords.contains(w) && hasWord(t, w)))) {
+        return c;
+      }
+    }
+    // 3. "mi contacto de emergencia" / "alguien" -> el primero
+    if (hasAnyWord(t, const ['contacto', 'contacto de emergencia', 'emergencia', 'alguien', 'familia', 'familiar'])) {
+      return contacts.first;
+    }
+    return null;
+  }
+
+  Future<List<EmergencyContact>> _loadEmergencyContacts() async {
+    try {
+      return await _firebaseService.getEmergencyContacts().timeout(const Duration(seconds: 4));
+    } catch (e) {
+      debugPrint('[Emergencia] No pude leer los contactos: $e');
+      return const [];
+    }
+  }
+
+  /// Emergencia o pedido de llamada (resuelto localmente, sin Gemini).
+  Future<VoiceAssistantResponse?> _handleEmergencyOrCall(String prompt) async {
+    final target = callTargetPhrase(prompt);
+    final distress = isDistress(prompt);
+    if (target == null && !distress) return null;
+
+    final contacts = await _loadEmergencyContacts();
+    if (target != null) {
+      final c = matchContact(target, contacts);
+      if (c != null) {
+        return VoiceAssistantResponse(
+          textResponse: 'Te comunico con ${c.label}. Toca el botón verde para llamar.',
+          action: AppVoiceAction.callContact,
+          phoneToCall: c.phone,
+          targetName: c.label,
+        );
+      }
+      // No se reconoció a quién: se muestran todos.
+      return VoiceAssistantResponse(
+        textResponse: contacts.isEmpty
+            ? 'No tienes contactos de emergencia guardados. Puedes agregarlos en tu perfil. '
+                'Si es urgente, toca el botón para llamar al 123.'
+            : 'No estoy segura de a quién llamar. Toca el nombre de la persona que quieres llamar.',
+        action: AppVoiceAction.emergency,
+        emergencyContacts: contacts,
+      );
+    }
+
+    // Se siente mal: empatía + ofrecer llamar (no se llama solo).
+    final names = contacts.take(3).map((c) => c.label).toList();
+    final text = contacts.isEmpty
+        ? 'Lo siento mucho. No tienes contactos de emergencia guardados; puedes agregarlos en tu perfil. '
+            'Si es urgente, toca el botón para llamar al 123.'
+        : 'Lo siento mucho, aquí estoy. ¿Quieres que llame a alguien? Toca el nombre para llamar a '
+            '${names.length > 1 ? '${names.sublist(0, names.length - 1).join(', ')} o ${names.last}' : names.first}, '
+            'o al 123 si es urgente.';
+    return VoiceAssistantResponse(
+      textResponse: text,
+      action: AppVoiceAction.emergency,
+      emergencyContacts: contacts,
+    );
+  }
+
+  // ================= PERFIL POR VOZ =================
+
+  /// Etiqueta legible de cada campo del perfil (users/{uid}).
+  static const Map<String, String> profileFieldLabels = {
+    'name': 'nombre',
+    'lastName': 'apellidos',
+    'fixedPhone': 'teléfono fijo',
+    'cellPhone': 'celular',
+    'diagnosisYear': 'año de diagnóstico',
+    'experience': 'tu experiencia',
+    'specialistName': 'doctor',
+    'specialistType': 'especialidad',
+    'hospital': 'hospital',
+    'consultationTime': 'horario de consulta',
+    'supportGroup': 'grupo de apoyo',
+  };
+
+  /// Claves que puede usar Gemini en [UPDATE_PROFILE|clave=valor] -> campo.
+  static const Map<String, String> _profileTagKeys = {
+    'nombre': 'name', 'apellido': 'lastName', 'apellidos': 'lastName',
+    'telefono_fijo': 'fixedPhone', 'fijo': 'fixedPhone',
+    'celular': 'cellPhone', 'telefono': 'cellPhone', 'telefono_celular': 'cellPhone',
+    'anio_diagnostico': 'diagnosisYear', 'ano_diagnostico': 'diagnosisYear', 'diagnostico': 'diagnosisYear',
+    'experiencia': 'experience',
+    'doctor': 'specialistName', 'medico': 'specialistName', 'especialista': 'specialistName',
+    'especialidad': 'specialistType',
+    'hospital': 'hospital', 'clinica': 'hospital', 'institucion': 'hospital',
+    'horario': 'consultationTime', 'horario_consulta': 'consultationTime', 'consulta': 'consultationTime',
+    'grupo': 'supportGroup', 'grupo_apoyo': 'supportGroup',
+  };
+
+  /// Especialidad a uno de los valores de la lista del perfil.
+  static String normalizeSpecialty(String raw) {
+    final n = normalizeText(raw);
+    if (n.contains('neuropsicolog')) return 'Neuropsicología';
+    if (n.contains('neurolog')) return 'Neurología';
+    if (n.contains('interna') || n.contains('internista')) return 'Medicina interna';
+    if (n.contains('fisioterap')) return 'Fisioterapia';
+    return 'Otro';
+  }
+
+  static String _titleCase(String s) => s
+      .trim()
+      .split(RegExp(r'\s+'))
+      .where((w) => w.isNotEmpty)
+      .map((w) => const {'de', 'del', 'la', 'las', 'los', 'y'}.contains(w.toLowerCase())
+          ? w.toLowerCase()
+          : w[0].toUpperCase() + w.substring(1))
+      .join(' ');
+
+  /// Valida y normaliza un valor; devuelve null si no sirve.
+  static Object? _cleanProfileValue(String field, String raw) {
+    final v = raw.trim().replaceAll(RegExp(r'[.;,]+$'), '').trim();
+    if (v.isEmpty) return null;
+    switch (field) {
+      case 'diagnosisYear':
+        final year = int.tryParse(RegExp(r'(19|20)\d{2}').firstMatch(v)?.group(0) ?? '');
+        if (year == null || year < 1950 || year > DateTime.now().year) return null;
+        return year;
+      case 'cellPhone':
+      case 'fixedPhone':
+        final digits = v.replaceAll(RegExp(r'[^\d+]'), '');
+        return digits.replaceAll('+', '').length >= 7 ? digits : null;
+      case 'specialistType':
+        return normalizeSpecialty(v);
+      case 'name':
+      case 'lastName':
+      case 'specialistName':
+      case 'hospital':
+      case 'supportGroup':
+        return _titleCase(v);
+      default:
+        return v[0].toUpperCase() + v.substring(1);
+    }
+  }
+
+  /// Cuerpo de [UPDATE_PROFILE|doctor=Juan Pérez|hospital=San Ignacio].
+  @visibleForTesting
+  static Map<String, Object> parseProfileTag(String body) {
+    final result = <String, Object>{};
+    for (final part in body.split('|')) {
+      final i = part.indexOf('=');
+      if (i <= 0) continue;
+      final key = normalizeText(part.substring(0, i)).replaceAll(' ', '_');
+      final field = _profileTagKeys[key];
+      if (field == null) continue;
+      final value = _cleanProfileValue(field, part.substring(i + 1));
+      if (value != null) result[field] = value;
+    }
+    // "mi neurólogo es ..." -> especialidad Neurología si no vino.
+    return result;
+  }
+
+  /// Respaldo local (sin Gemini) para frases comunes del perfil.
+  @visibleForTesting
+  static Map<String, Object> extractProfileUpdates(String prompt) {
+    final text = prompt.trim().replaceAll(RegExp(r'\s+'), ' ');
+    final lower = text.toLowerCase();
+    final result = <String, Object>{};
+    void put(String field, String? raw) {
+      if (raw == null) return;
+      final v = _cleanProfileValue(field, raw);
+      if (v != null) result[field] = v;
+    }
+
+    // Texto ORIGINAL (con mayúsculas y tildes) del grupo [g] de [m] en [lower].
+    String orig(RegExpMatch m, int g) {
+      final s = lower.indexOf(m.group(g)!, m.start);
+      return text.substring(s, s + m.group(g)!.length);
+    }
+
+    const stop = r'(?=\s+(?:y|en|del|de la|que|me|por|a las|los|las|el|la|con|para)\b|[.,;]|$)';
+    const word = r"[a-záéíóúüñ][a-záéíóúüñ'\.]*";
+
+    // Doctor: "mi doctor se llama Juan Pérez", "mi neuróloga es la doctora Ana Ruiz"
+    final doc = RegExp(
+      '(?:mi |el |la )?(doctor|doctora|m[eé]dico|m[eé]dica|neur[oó]log[oa]|especialista)'
+      '(?: tratante)?(?: se llama| es| es el| es la)? (?:el |la )?(?:doctor |doctora |dr\\.? |dra\\.? )?'
+      '($word(?: $word){0,3}?)$stop',
+    ).firstMatch(lower);
+    if (doc != null && RegExp(r'\b(se llama|es)\b').hasMatch(lower)) {
+      put('specialistName', orig(doc, 2));
+      if (doc.group(1)!.contains('neur')) result['specialistType'] = 'Neurología';
+    }
+
+    // Especialidad dicha aparte: "mi especialista es neurólogo"
+    final spec = RegExp(r'(?:especialidad|especialista) (?:es )?(?:en )?(neurolog\w*|neuropsicolog\w*|fisioterap\w*|medicina interna|internista)')
+        .firstMatch(lower);
+    if (spec != null) result['specialistType'] = normalizeSpecialty(spec.group(1)!);
+
+    // Hospital: "me atienden en el hospital San Ignacio", "mi clínica es la Fundación Santa Fe"
+    final hosp = RegExp('(hospital|cl[ií]nica|fundaci[oó]n|centro m[eé]dico) ($word(?: $word){0,4}?)$stop')
+        .firstMatch(lower);
+    if (hosp != null && RegExp(r'(atiend|consulta|voy|mi (hospital|cl[ií]nica)|es (el|la))').hasMatch(lower)) {
+      put('hospital', '${orig(hosp, 1)} ${orig(hosp, 2)}');
+    }
+
+    // Teléfonos
+    final fixed = RegExp(r'(?:tel[eé]fono fijo|fijo)(?: es)?:? ([\d\s\-+]{7,})').firstMatch(lower);
+    if (fixed != null) put('fixedPhone', fixed.group(1));
+    final cell = RegExp(r'(?:celular|mi n[uú]mero|tel[eé]fono celular|mi tel[eé]fono)(?: es)?:? ([\d\s\-+]{7,})').firstMatch(lower);
+    if (cell != null) put('cellPhone', cell.group(1));
+
+    // Año de diagnóstico: "me diagnosticaron en 2019"
+    final diag = RegExp(r'diagn[oó]stic\w*[^0-9]{0,30}((?:19|20)\d{2})').firstMatch(lower);
+    if (diag != null) put('diagnosisYear', diag.group(1));
+
+    // Horario de consulta: "mi consulta es los martes a las 3 de la tarde"
+    final cons = RegExp(r'(?:mi |la )?(?:consulta|cita)(?: m[eé]dica)? (?:es|son|la tengo|queda)? ?((?:los|el|cada|todos) .{3,60})$')
+        .firstMatch(lower);
+    if (cons != null) {
+      put('consultationTime', orig(cons, 1));
+    }
+
+    // Nombre: "me llamo Ana María Gómez"
+    final me = RegExp('me llamo ($word(?: $word){0,4})').firstMatch(lower);
+    if (me != null) {
+      final parts = orig(me, 1).split(' ');
+      put('name', parts.first);
+      if (parts.length > 1) put('lastName', parts.sublist(1).join(' '));
+    }
+    return result;
+  }
+
+  /// "Listo, actualicé tu perfil: doctor, Juan Pérez; hospital, Hospital San Ignacio."
+  static String profileUpdateReply(Map<String, Object> updates) {
+    final parts = updates.entries
+        .map((e) => '${profileFieldLabels[e.key] ?? e.key}: ${e.value}')
+        .join('; ');
+    return 'Listo, actualicé tu perfil con $parts. Te abro tu perfil para que lo revises.';
+  }
+
+  String? _profileMissingCache;
+
+  /// "hospital, horario de consulta" (campos vacíos del perfil) para que
+  /// Gemini sepa qué preguntar al "completar el perfil". Se cachea.
+  Future<String> _profileMissingSummary() async {
+    if (_profileMissingCache != null) return _profileMissingCache!;
+    try {
+      final p = await _firebaseService.getUserProfile().timeout(const Duration(seconds: 3));
+      if (p == null) return 'desconocido';
+      final missing = <String>[
+        if (p.name.isEmpty) 'nombre',
+        if (p.lastName.isEmpty) 'apellidos',
+        if (p.cellPhone.isEmpty) 'celular',
+        if (p.fixedPhone.isEmpty) 'teléfono fijo',
+        if (p.diagnosisYear == null) 'año de diagnóstico',
+        if (p.experience.isEmpty) 'experiencia',
+        if (p.specialistName.isEmpty) 'doctor',
+        if (p.hospital.isEmpty) 'hospital',
+        if (p.consultationTime.isEmpty) 'horario de consulta',
+        if (p.supportGroup.isEmpty) 'grupo de apoyo',
+      ];
+      _profileMissingCache = missing.isEmpty ? 'ninguno (perfil completo)' : missing.join(', ');
+      return _profileMissingCache!;
+    } catch (_) {
+      return 'desconocido';
+    }
+  }
+
   // ================= NORMALIZACIÓN Y PALABRAS COMPLETAS =================
 
   /// Minúsculas, sin tildes (excepto ñ), sin puntuación y con espacios simples.
@@ -1637,6 +2569,15 @@ Mensaje del usuario: "$cleanPrompt"
 
   static AppVoiceAction _detectActionFromPrompt(String prompt) {
     final norm = normalizeText(prompt);
+
+    // --- Consultas del día (antes que navegación: "¿cómo va mi temblor hoy?"
+    // no debe solo abrir la sección) ---
+    final query = detectDayQuery(prompt);
+    if (query != AppVoiceAction.none) return query;
+
+    // --- Recordatorios (antes que el registro: "recordatorio para tomar la
+    // amoxicilina" no es una toma ya hecha) ---
+    if (isReminderRequest(prompt)) return AppVoiceAction.openReminders;
 
     // --- Privacy toggle ---
     if (hasAnyWord(norm, _privatePhrases)) return AppVoiceAction.togglePrivacyPrivate;
@@ -1750,6 +2691,17 @@ Mensaje del usuario: "$cleanPrompt"
     switch (action) {
       case AppVoiceAction.openHome:
         return 'Listo, te llevo al inicio.';
+      case AppVoiceAction.queryTremorToday:
+      case AppVoiceAction.queryMedicationToday:
+        return ''; // la respuesta se arma con datos reales en processPrompt
+      case AppVoiceAction.emergency:
+        return 'Lo siento mucho. Toca el nombre de la persona que quieres llamar, o el 123 si es urgente.';
+      case AppVoiceAction.callContact:
+        return 'Te comunico. Toca el botón verde para llamar.';
+      case AppVoiceAction.openReminders:
+        return targetName != null
+            ? 'Te abro los recordatorios para que elijas las horas de $targetName.'
+            : 'Te abro los recordatorios para que programes las horas de tus medicamentos.';
       case AppVoiceAction.openMedication:
         return 'Con gusto, abriendo la sección de medicamentos.';
       case AppVoiceAction.openTremor:
@@ -1842,12 +2794,44 @@ REGLAS Y DINÁMICAS DE INTERACCIÓN FLEXIBLE:
    - Si el paciente te saluda o pregunta qué puedes hacer:
      Salúdalo amablemente y dale opciones breves (ej: "Hola, puedo ayudarte a registrar tus medicamentos, comidas, ejercicios o revisar tu temblor"). No incluyas etiquetas.
 
-4. VOLVER AL INICIO:
+4. CONSULTAS DEL DÍA (los datos los pone la app, no tú):
+   - Si pregunta cómo ha estado su temblor hoy ("¿cómo va mi temblor?", "resumen de mi temblor de hoy"):
+     responde SOLO "Déjame revisar tus datos de hoy. [ACTION:QUERY_TREMOR_TODAY]". No inventes cifras ni des diagnósticos.
+   - Si pregunta qué medicamentos tiene hoy o cuáles le faltan ("¿qué pastillas me tocan hoy?"):
+     responde SOLO "Déjame revisar tus medicamentos de hoy. [ACTION:QUERY_MEDS_TODAY]".
+
+3b. EMERGENCIA (lo más importante):
+   - Si el paciente expresa un malestar fuerte o peligro (se cayó, se siente muy mal, dolor en el pecho, no puede
+     respirar, se va a desmayar, pide auxilio): responde con empatía en UNA frase breve y agrega `[ACTION:EMERGENCY]`.
+     La app le mostrará botones para llamar a sus contactos de emergencia o al 123. No des diagnósticos.
+
+4a. RECORDATORIOS DE MEDICAMENTOS (avisos FUTUROS, no una toma ya hecha):
+   - Si pide un recordatorio, alarma o aviso para tomar un medicamento ("recuérdame tomar la levodopa",
+     "quiero poner un recordatorio de la amoxicilina"): NO uses [REGISTER_MEDICATION].
+     Responde "Te abro los recordatorios para que elijas las horas de NOMBRE. [ACTION:OPEN_REMINDERS|name=NOMBRE]".
+     Si no dice el medicamento: "Te abro los recordatorios. [ACTION:OPEN_REMINDERS]".
+
+4c. PERFIL DEL PACIENTE (datos para su ficha; la app los guarda):
+   - Si el paciente da datos de sí mismo o de su atención médica (su doctor o especialista, la especialidad,
+     el hospital o clínica, el horario de su consulta, su celular o teléfono fijo, el año en que lo diagnosticaron,
+     su experiencia con la enfermedad, su grupo de apoyo, su nombre o apellidos), responde confirmando y agrega
+     UNA etiqueta con SOLO los datos que dijo, exactamente como los dijo (no inventes ni completes):
+     `[UPDATE_PROFILE|doctor=NOMBRE|especialidad=ESPECIALIDAD|hospital=NOMBRE|horario=TEXTO|celular=NÚMERO|fijo=NÚMERO|anio_diagnostico=AAAA|experiencia=TEXTO|grupo=NOMBRE|nombre=NOMBRE|apellidos=APELLIDOS]`
+     Ejemplo: "Mi doctor es el neurólogo Juan Pérez del Hospital San Ignacio" ->
+     "Listo, guardé a tu doctor. [UPDATE_PROFILE|doctor=Juan Pérez|especialidad=Neurología|hospital=Hospital San Ignacio]"
+   - Si pide completar o actualizar su perfil sin dar datos, mira CAMPOS VACÍOS DEL PERFIL y pregunta por UNO
+     de ellos (ej.: "¿Cómo se llama tu doctor?"). Cuando responda, guárdalo con la etiqueta y pregunta el siguiente.
+   - Nunca uses [UPDATE_PROFILE] para datos de otra persona que no sean su propio médico o atención.
+
+4b. VOLVER AL INICIO:
    - Si el paciente pide volver, regresar, ir atrás, al inicio, al menú principal o a la pantalla principal:
      responde algo breve como "Listo, te llevo al inicio." con `[ACTION:OPEN_HOME]`.
 
 5. ETIQUETAS DE ACCIÓN Y REGISTRO OBLIGATORIAS:
    - Inicio / menú principal: `[ACTION:OPEN_HOME]`
+   - Consultar temblor de hoy: `[ACTION:QUERY_TREMOR_TODAY]`
+   - Consultar medicamentos de hoy: `[ACTION:QUERY_MEDS_TODAY]`
+   - Crear recordatorio de medicamento: `[ACTION:OPEN_REMINDERS|name=NOMBRE]` o `[ACTION:OPEN_REMINDERS]`
    - Medicamentos: `[REGISTER_MEDICATION|name=NOMBRE|time=HH:MM]` y `[ACTION:OPEN_MEDICATION]`
    - Alimentación: `[REGISTER_FOOD|food=NOMBRE|mealType=Desayuno/Almuerzo/Cena/Merienda|time=HH:MM]` y `[ACTION:OPEN_HABITS_FOOD]`
    - Actividad Física: `[REGISTER_ACTIVITY|activityType=NOMBRE|duration=MINUTOS|intensity=Leve/Media/Alta|time=HH:MM]` y `[ACTION:OPEN_HABITS_ACTIVITY]`

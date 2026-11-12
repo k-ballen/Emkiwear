@@ -179,17 +179,6 @@ void showCompanionDetails(BuildContext context, UserProfile p) {
             const SizedBox(height: 16),
             Center(
               child: Text(
-                '\${p.name} \${p.lastName}',
-                style: const TextStyle(
-                  fontSize: 26,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFF6A1B9A),
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Center(
-              child: Text(
                 p.supportGroup.isNotEmpty ? p.supportGroup : 'Sin grupo',
                 style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
               ),

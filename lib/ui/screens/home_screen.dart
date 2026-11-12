@@ -8,6 +8,11 @@ import '../../services/voice_assistant_service.dart';
 import '../widgets/assistant_button.dart';
 import 'tremor_chart_screen.dart';
 import 'medication_screen.dart';
+import 'reminders_screen.dart';
+import '../../models/medication_reminder.dart';
+import '../../models/emergency_contact.dart';
+import '../../services/call_service.dart';
+import 'emergency_contacts_screen.dart';
 import 'habits_screen.dart';
 import 'community_screen.dart';
 import 'profile_screen.dart';
@@ -277,11 +282,16 @@ class _AssistantModalState extends State<AssistantModal> {
       _isProcessing = false;
       _userText = '';
       _assistantText = '';
-      _statusMessage = 'Te escucho... Habla ahora.';
+      _emergencyContacts = null;
+      _phoneToCall = null;
+      _callLabel = null;
+      _statusMessage = 'Te escucho... Habla con calma. Cuando termines, toca TERMINÉ DE HABLAR.';
     });
 
     await _voiceService.listen(
-      duration: const Duration(seconds: 15),
+      // Tiempo máximo de cada tramo; la frase completa puede tener varios
+      // tramos (escucha continua) hasta 40 s o hasta "TERMINÉ DE HABLAR".
+      duration: const Duration(seconds: 40),
       onResult: (recognizedWords, isFinal) {
         if (!mounted) return;
         setState(() {
@@ -309,20 +319,77 @@ class _AssistantModalState extends State<AssistantModal> {
 
     if (!mounted) return;
 
+    final isEmergency = response.action == AppVoiceAction.emergency ||
+        response.action == AppVoiceAction.callContact;
     setState(() {
       _isProcessing = false;
       _assistantText = response.textResponse;
-      _statusMessage = response.action != AppVoiceAction.none
-          ? 'Sección abierta. Asistente activo.'
-          : 'Respuesta generada.';
+      // Emergencia: botones de llamada en el modal (no se navega).
+      _emergencyContacts = isEmergency ? (response.emergencyContacts ?? const []) : null;
+      _phoneToCall = response.phoneToCall;
+      _callLabel = response.targetName;
+      _statusMessage = isEmergency
+          ? 'Toca un botón para llamar.'
+          : response.action != AppVoiceAction.none
+              ? 'Sección abierta. Asistente activo.'
+              : 'Respuesta generada.';
     });
 
-    if (response.action != AppVoiceAction.none) {
-      _navigateToTargetSection(response.action, response.targetName);
+    if (response.action == AppVoiceAction.callContact && response.phoneToCall != null) {
+      // "Llama a mi hija": se abre el marcador con el número (un toque para llamar).
+      await CallService.dial(response.phoneToCall!);
+      return;
+    }
+    if (!isEmergency && response.action != AppVoiceAction.none) {
+      _navigateToTargetSection(response.action, response.targetName, response.reminderDraft);
     }
   }
 
-  void _navigateToTargetSection(AppVoiceAction action, [String? targetName]) {
+  // Emergencia: contactos y número a mostrar como botones de llamada.
+  List<EmergencyContact>? _emergencyContacts;
+  String? _phoneToCall;
+  String? _callLabel;
+
+  Widget _buildEmergencyButtons() {
+    final contacts = _emergencyContacts ?? const <EmergencyContact>[];
+    Widget callButton(String label, String phone, {Color color = Colors.green}) => Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: () => CallService.dial(phone),
+              icon: const Icon(Icons.call),
+              label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+              style: FilledButton.styleFrom(
+                backgroundColor: color,
+                minimumSize: const Size.fromHeight(48),
+                textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        );
+
+    return Column(
+      children: [
+        if (_phoneToCall != null)
+          callButton('Llamar a ${_callLabel ?? _phoneToCall}', _phoneToCall!)
+        else
+          ...contacts.map((c) => callButton('Llamar a ${c.label}', c.phone)),
+        callButton('Emergencias 123', CallService.emergencyNumber, color: Colors.red),
+        if (contacts.isEmpty && _phoneToCall == null)
+          TextButton.icon(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const EmergencyContactsScreen()),
+            ),
+            icon: const Icon(Icons.person_add),
+            label: const Text('Agregar contactos de emergencia'),
+          ),
+      ],
+    );
+  }
+
+  void _navigateToTargetSection(AppVoiceAction action,
+      [String? targetName, MedicationReminder? reminderDraft]) {
     if (!mounted) return;
 
     Widget targetScreen;
@@ -333,10 +400,16 @@ class _AssistantModalState extends State<AssistantModal> {
         Navigator.of(context).popUntil((route) => route.isFirst);
         return;
       case AppVoiceAction.openTremor:
+      case AppVoiceAction.queryTremorToday:
         targetScreen = const TremorChartScreen();
         break;
       case AppVoiceAction.openMedication:
+      case AppVoiceAction.queryMedicationToday:
         targetScreen = const MedicationScreen();
+        break;
+      case AppVoiceAction.openReminders:
+        // Editor de recordatorio con el medicamento ya escrito (si se dijo).
+        targetScreen = ReminderEditorScreen(initialName: targetName, draft: reminderDraft);
         break;
       case AppVoiceAction.openHabits:
       case AppVoiceAction.openHabitsFood:
@@ -382,6 +455,9 @@ class _AssistantModalState extends State<AssistantModal> {
       case AppVoiceAction.openProfile:
         targetScreen = const ProfileScreen();
         break;
+      case AppVoiceAction.emergency:
+      case AppVoiceAction.callContact:
+        return; // se manejan con botones de llamada en el modal
       case AppVoiceAction.none:
         return;
     }
@@ -581,6 +657,7 @@ class _AssistantModalState extends State<AssistantModal> {
                             ],
                           ),
                         ),
+                      if (_emergencyContacts != null && !_isProcessing) _buildEmergencyButtons(),
                     ],
                   ),
                 ),
@@ -629,6 +706,28 @@ class _AssistantModalState extends State<AssistantModal> {
                       ),
                     ),
                   ),
+                  if (_isListening) ...[
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        // Envía ya lo dicho, sin esperar los segundos de silencio.
+                        onPressed: _voiceService.finishListening,
+                        icon: const Icon(Icons.check, size: 18),
+                        label: const FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text('TERMINÉ DE HABLAR', maxLines: 1),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green.shade600,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+                          minimumSize: const Size(0, 46),
+                          textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ),
+                  ],
                   if (!_isListening && !_isProcessing) ...[
                     const SizedBox(width: 10),
                     Expanded(
